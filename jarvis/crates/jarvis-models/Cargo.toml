@@ -1,0 +1,20 @@
+[package]
+name = "jarvis-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+jarvis-runtime.workspace = true
+jarvis-context.workspace = true
+jarvis-resources.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true

@@ -1,0 +1,311 @@
+//! Resource Manager: erkennt Hardware, misst RAM/CPU/Akku/Thermik und leitet
+//! daraus einen Betriebsmodus und die passende Modellauswahl ab.
+
+use serde::Serialize;
+use std::process::Command;
+use sysinfo::System;
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Hardware {
+    pub os: String,
+    pub arch: String,
+    pub cpu_brand: String,
+    pub cpu_cores: usize,
+    pub total_ram_gb: f64,
+    pub apple_silicon: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct Battery {
+    pub percent: u8,
+    pub charging: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Thermal {
+    Nominal,
+    Fair,
+    Serious,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Snapshot {
+    pub total_ram_gb: f64,
+    pub available_ram_gb: f64,
+    pub cpu_usage_percent: f32,
+    pub battery: Option<Battery>,
+    pub thermal: Thermal,
+    pub low_power_mode: bool,
+}
+
+/// Betriebsmodus, aus dem sich Modell-, Voice- und Dienst-Entscheidungen ableiten.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Mode {
+    /// Netzteil, genug Speicher: Hauptmodell, Whisper turbo.
+    Performance,
+    /// Normalbetrieb auf Akku.
+    Balanced,
+    /// Wenig Akku / Low Power: Fallback-Modell, Whisper small, kurze keep_alive.
+    Saver,
+    /// Kritisch: nur Text, Modell nach jeder Antwort entladen.
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ModelProfile {
+    pub main: String,
+    pub fallback: String,
+    pub embedding: String,
+    pub context_window: usize,
+    pub stt_model: String,
+    pub stt_fallback: String,
+    /// Empfohlenes RAM-Budget für alle KI-Komponenten zusammen.
+    pub ai_ram_budget_gb: f64,
+}
+
+/// Wählt Modelle passend zur Hardware. Die Werte sind bewusst konservativ,
+/// damit macOS, Browser und UI daneben flüssig bleiben.
+pub fn recommend_profile(hw: &Hardware) -> ModelProfile {
+    let ram = hw.total_ram_gb;
+    let (main, fallback, ctx, budget) = if ram >= 30.0 {
+        ("qwen3:14b", "qwen3:8b", 16384, 14.0)
+    } else if ram >= 15.0 {
+        ("qwen3:8b", "qwen3:4b", 8192, 7.0)
+    } else if ram >= 7.5 {
+        ("qwen3:4b", "qwen3:1.7b", 4096, 3.5)
+    } else {
+        ("qwen3:1.7b", "qwen3:0.6b", 4096, 2.0)
+    };
+    let strong_gpu = hw.apple_silicon && ram >= 15.0;
+    ModelProfile {
+        main: main.into(),
+        fallback: fallback.into(),
+        embedding: "nomic-embed-text".into(),
+        context_window: ctx,
+        stt_model: if strong_gpu { "ggml-large-v3-turbo-q5_0.bin" } else { "ggml-small.bin" }.into(),
+        stt_fallback: "ggml-small.bin".into(),
+        ai_ram_budget_gb: budget,
+    }
+}
+
+pub fn decide_mode(s: &Snapshot) -> Mode {
+    let on_battery = s.battery.map(|b| !b.charging).unwrap_or(false);
+    let pct = s.battery.map(|b| b.percent).unwrap_or(100);
+    if s.thermal >= Thermal::Serious || (on_battery && pct < 15) || s.available_ram_gb < 1.0 {
+        Mode::Critical
+    } else if s.low_power_mode || (on_battery && pct < 40) || s.thermal == Thermal::Fair || s.available_ram_gb < 3.0 {
+        Mode::Saver
+    } else if on_battery {
+        Mode::Balanced
+    } else {
+        Mode::Performance
+    }
+}
+
+/// Konkrete Einstellungen je Modus.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ModeSettings {
+    pub use_fallback_model: bool,
+    pub keep_alive_secs: u64,
+    pub voice_enabled: bool,
+    pub use_stt_fallback: bool,
+    pub wake_word_allowed: bool,
+    pub background_embeddings: bool,
+}
+
+pub fn settings_for(mode: Mode) -> ModeSettings {
+    match mode {
+        Mode::Performance => ModeSettings {
+            use_fallback_model: false,
+            keep_alive_secs: 300,
+            voice_enabled: true,
+            use_stt_fallback: false,
+            wake_word_allowed: true,
+            background_embeddings: true,
+        },
+        Mode::Balanced => ModeSettings {
+            use_fallback_model: false,
+            keep_alive_secs: 120,
+            voice_enabled: true,
+            use_stt_fallback: false,
+            wake_word_allowed: false,
+            background_embeddings: false,
+        },
+        Mode::Saver => ModeSettings {
+            use_fallback_model: true,
+            keep_alive_secs: 30,
+            voice_enabled: true,
+            use_stt_fallback: true,
+            wake_word_allowed: false,
+            background_embeddings: false,
+        },
+        Mode::Critical => ModeSettings {
+            use_fallback_model: true,
+            keep_alive_secs: 0,
+            voice_enabled: false,
+            use_stt_fallback: true,
+            wake_word_allowed: false,
+            background_embeddings: false,
+        },
+    }
+}
+
+fn run(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(cmd).args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Liest `pmset -g batt` (macOS).
+pub fn parse_pmset_batt(out: &str) -> Option<Battery> {
+    let line = out.lines().find(|l| l.contains('%'))?;
+    let pct_end = line.find('%')?;
+    let start = line[..pct_end].rfind(|c: char| !c.is_ascii_digit()).map(|i| i + 1).unwrap_or(0);
+    let percent: u8 = line[start..pct_end].parse().ok()?;
+    let ac = out.contains("AC Power");
+    let charging = ac || line.contains("; charging") || line.contains("charged");
+    Some(Battery { percent, charging: charging && !line.contains("discharging") })
+}
+
+/// Liest `pmset -g therm` (macOS). CPU_Speed_Limit < 100 bedeutet Drosselung.
+pub fn parse_pmset_therm(out: &str) -> Thermal {
+    let limit = out
+        .lines()
+        .find(|l| l.contains("CPU_Speed_Limit"))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(100);
+    match limit {
+        90..=u32::MAX => Thermal::Nominal,
+        70..=89 => Thermal::Fair,
+        40..=69 => Thermal::Serious,
+        _ => Thermal::Critical,
+    }
+}
+
+pub fn detect_hardware() -> Hardware {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.refresh_cpu_all();
+    let arch = std::env::consts::ARCH.to_string();
+    let os = std::env::consts::OS.to_string();
+    let mut cpu_brand = sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_default();
+    if os == "macos" {
+        if let Some(b) = run("sysctl", &["-n", "machdep.cpu.brand_string"]) {
+            cpu_brand = b.trim().to_string();
+        }
+    }
+    Hardware {
+        apple_silicon: os == "macos" && arch == "aarch64",
+        os,
+        arch,
+        cpu_brand,
+        cpu_cores: sys.cpus().len(),
+        total_ram_gb: sys.total_memory() as f64 / 1024f64.powi(3),
+    }
+}
+
+pub struct Monitor {
+    sys: System,
+}
+
+impl Default for Monitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Monitor {
+    pub fn new() -> Self {
+        Self { sys: System::new() }
+    }
+
+    pub fn snapshot(&mut self) -> Snapshot {
+        self.sys.refresh_memory();
+        self.sys.refresh_cpu_usage();
+        let mac = cfg!(target_os = "macos");
+        let battery = if mac { run("pmset", &["-g", "batt"]).as_deref().and_then(parse_pmset_batt) } else { None };
+        let thermal = if mac { run("pmset", &["-g", "therm"]).map(|o| parse_pmset_therm(&o)).unwrap_or(Thermal::Nominal) } else { Thermal::Nominal };
+        let low_power_mode = mac
+            && run("pmset", &["-g"])
+                .map(|o| o.lines().any(|l| l.trim_start().starts_with("lowpowermode") && l.trim_end().ends_with('1')))
+                .unwrap_or(false);
+        let gb = 1024f64.powi(3);
+        Snapshot {
+            total_ram_gb: self.sys.total_memory() as f64 / gb,
+            available_ram_gb: self.sys.available_memory() as f64 / gb,
+            cpu_usage_percent: self.sys.global_cpu_usage(),
+            battery,
+            thermal,
+            low_power_mode,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hw(ram: f64, apple: bool) -> Hardware {
+        Hardware { os: "macos".into(), arch: "aarch64".into(), cpu_brand: "Apple M2".into(), cpu_cores: 8, total_ram_gb: ram, apple_silicon: apple }
+    }
+
+    fn snap(batt: Option<(u8, bool)>, avail: f64) -> Snapshot {
+        Snapshot {
+            total_ram_gb: 16.0,
+            available_ram_gb: avail,
+            cpu_usage_percent: 10.0,
+            battery: batt.map(|(p, c)| Battery { percent: p, charging: c }),
+            thermal: Thermal::Nominal,
+            low_power_mode: false,
+        }
+    }
+
+    #[test]
+    fn profile_for_16gb_macbook_air() {
+        let p = recommend_profile(&hw(16.0, true));
+        assert_eq!(p.main, "qwen3:8b");
+        assert_eq!(p.fallback, "qwen3:4b");
+        assert_eq!(p.context_window, 8192);
+        assert!(p.stt_model.contains("turbo"));
+        assert!(p.ai_ram_budget_gb <= 7.0);
+        assert_eq!(recommend_profile(&hw(8.0, true)).main, "qwen3:4b");
+        assert_eq!(recommend_profile(&hw(16.0, false)).stt_model, "ggml-small.bin");
+    }
+
+    #[test]
+    fn modes() {
+        assert_eq!(decide_mode(&snap(Some((80, true)), 8.0)), Mode::Performance);
+        assert_eq!(decide_mode(&snap(None, 8.0)), Mode::Performance);
+        assert_eq!(decide_mode(&snap(Some((80, false)), 8.0)), Mode::Balanced);
+        assert_eq!(decide_mode(&snap(Some((30, false)), 8.0)), Mode::Saver);
+        assert_eq!(decide_mode(&snap(Some((10, false)), 8.0)), Mode::Critical);
+        assert_eq!(decide_mode(&snap(Some((90, true)), 2.0)), Mode::Saver);
+        assert_eq!(decide_mode(&snap(Some((90, true)), 0.5)), Mode::Critical);
+        let mut s = snap(Some((90, true)), 8.0);
+        s.thermal = Thermal::Serious;
+        assert_eq!(decide_mode(&s), Mode::Critical);
+        assert!(!settings_for(Mode::Critical).voice_enabled);
+        assert!(settings_for(Mode::Saver).use_fallback_model);
+    }
+
+    #[test]
+    fn pmset_parsing() {
+        let discharging = "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1234)\t67%; discharging; 5:12 remaining present: true";
+        assert_eq!(parse_pmset_batt(discharging), Some(Battery { percent: 67, charging: false }));
+        let ac = "Now drawing from 'AC Power'\n -InternalBattery-0 (id=1234)\t100%; charged; 0:00 remaining present: true";
+        assert_eq!(parse_pmset_batt(ac), Some(Battery { percent: 100, charging: true }));
+        assert_eq!(parse_pmset_batt("Now drawing from 'AC Power'"), None);
+        assert_eq!(parse_pmset_therm("Note: No thermal warning level has been recorded"), Thermal::Nominal);
+        assert_eq!(parse_pmset_therm("CPU_Scheduler_Limit \t= 100\nCPU_Speed_Limit \t= 60"), Thermal::Serious);
+    }
+
+    #[test]
+    fn live_snapshot_works_on_this_machine() {
+        let mut m = Monitor::new();
+        let s = m.snapshot();
+        assert!(s.total_ram_gb > 0.5);
+        let h = detect_hardware();
+        assert!(h.cpu_cores > 0);
+    }
+}

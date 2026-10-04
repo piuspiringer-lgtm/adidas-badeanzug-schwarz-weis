@@ -1,0 +1,10 @@
+[package]
+name = "jarvis-resources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+sysinfo.workspace = true

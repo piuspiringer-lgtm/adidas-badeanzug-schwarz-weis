@@ -1,0 +1,360 @@
+//! `jarvis` – Kommandozeile zum Einrichten und Testen der Infrastruktur.
+
+use async_trait::async_trait;
+use clap::{Parser, Subcommand};
+use jarvis_app::*;
+use jarvis_context::{Message, Router};
+use jarvis_permissions::{CallFacts, Origin, ToolSpec};
+use jarvis_resources::{decide_mode, settings_for, Monitor};
+use jarvis_runtime::{Confirmer, Service};
+use jarvis_voice::{MacSay, SpeechToText, TextToSpeech, WhisperCli};
+use std::io::Write;
+use std::path::Path;
+use std::sync::Arc;
+
+#[derive(Parser)]
+#[command(name = "jarvis", version, about = "JARVIS – lokaler Assistent (Infrastruktur-Werkzeug)")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Beispiel-Konfiguration anlegen (überschreibt nichts).
+    Init,
+    /// Prüft alle Komponenten. Mit --online auch Netz-Integrationen (nur lesend).
+    Doctor {
+        #[arg(long)]
+        online: bool,
+    },
+    /// Listet alle Tools mit Berechtigungen.
+    Tools,
+    /// Führt ein Tool über den Gateway aus, z. B. `jarvis run fs_list '{"path":"~/Documents"}'`.
+    Run { tool: String, #[arg(default_value = "{}")] args: String },
+    /// Fragt das lokale Modell (mit Routing einfach/normal/komplex).
+    Ask { prompt: Vec<String> },
+    /// Anmeldung bei Microsoft 365 (nur Lese-Berechtigungen).
+    Login { provider: String },
+    /// Speichert ein Geheimnis im macOS-Schlüsselbund (z. B. webuntis_password, brave_api_key).
+    SetSecret { name: String },
+    /// Zeigt das Audit-Log und prüft die Hash-Kette.
+    Audit {
+        #[arg(default_value_t = 20)]
+        limit: usize,
+    },
+    /// Spricht einen Text (TTS-Test).
+    Say { text: Vec<String> },
+    /// Transkribiert eine WAV-Datei (STT-Test).
+    Transcribe { wav: String },
+}
+
+/// Fragt im Terminal nach. Ohne Terminal: immer Nein.
+struct TerminalConfirmer;
+
+#[async_trait]
+impl Confirmer for TerminalConfirmer {
+    async fn confirm(&self, spec: &ToolSpec, _facts: &CallFacts, reason: &str) -> bool {
+        eprint!("\n⚠️  Bestätigung nötig für '{}' ({:?}, Risiko {:?}):\n   {reason}\n   Ausführen? [j/N] ", spec.name, spec.access, spec.risk);
+        let _ = std::io::stderr().flush();
+        let mut s = String::new();
+        std::io::stdin().read_line(&mut s).is_ok() && matches!(s.trim().to_lowercase().as_str(), "j" | "ja" | "y" | "yes")
+    }
+}
+
+fn ok(label: &str, msg: impl std::fmt::Display) {
+    println!("  ✅ {label:<22} {msg}");
+}
+fn warn(label: &str, msg: impl std::fmt::Display) {
+    println!("  ⚠️  {label:<21} {msg}");
+}
+fn fail(label: &str, msg: impl std::fmt::Display) {
+    println!("  ❌ {label:<22} {msg}");
+}
+
+fn which(bin: &str) -> Option<String> {
+    let out = std::process::Command::new("sh").arg("-c").arg(format!("command -v {bin}")).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    let dir = data_dir();
+    if let Err(e) = run(cli.cmd, &dir).await {
+        eprintln!("Fehler: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run(cmd: Cmd, dir: &Path) -> Result<(), String> {
+    match cmd {
+        Cmd::Init => {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            let p = dir.join("config.toml");
+            if p.exists() {
+                println!("{} existiert bereits – nichts geändert.", p.display());
+            } else {
+                std::fs::write(&p, EXAMPLE_CONFIG).map_err(|e| e.to_string())?;
+                println!("Angelegt: {}", p.display());
+            }
+            Ok(())
+        }
+        Cmd::Doctor { online } => doctor(dir, online).await,
+        Cmd::Tools => {
+            let app = build(dir, Arc::new(TerminalConfirmer))?;
+            println!("{:<20} {:<11} {:<12} {:<8} {:<11} Fähigkeiten", "Tool", "Integration", "Zugriff", "Risiko", "Bestätigung");
+            for t in app.gateway.registry().list() {
+                let s = t.spec;
+                println!(
+                    "{:<20} {:<11} {:<12} {:<8} {:<11} {:?}",
+                    s.name,
+                    format!("{:?}", s.integration),
+                    format!("{:?}", s.access),
+                    format!("{:?}", s.risk),
+                    format!("{:?}", s.confirmation),
+                    s.capabilities
+                );
+            }
+            for (i, why) in &app.inactive {
+                println!("(inaktiv) {i}: {why}");
+            }
+            Ok(())
+        }
+        Cmd::Run { tool, args } => {
+            let app = build(dir, Arc::new(TerminalConfirmer))?;
+            let args: serde_json::Value = serde_json::from_str(&args).map_err(|e| format!("Argumente sind kein JSON: {e}"))?;
+            let out = app.gateway.invoke(&tool, args, Origin::User).await.map_err(|e| e.to_string())?;
+            println!("{}", out.text);
+            app.gateway.services().unload_all_unused().await;
+            Ok(())
+        }
+        Cmd::Ask { prompt } => {
+            let app = build(dir, Arc::new(TerminalConfirmer))?;
+            let prompt = prompt.join(" ");
+            let mut mon = Monitor::new();
+            let mode = decide_mode(&mon.snapshot());
+            let st = settings_for(mode);
+            app.models.set_force_fallback(st.use_fallback_model, st.keep_alive_secs);
+            let router = Router { strong_enabled: false, force_small: st.use_fallback_model };
+            let c = router.classify(&prompt, 0);
+            let tier = router.tier(c);
+            eprintln!("[Modus {mode:?} · Aufgabe {c:?} · {tier:?} → {}]", app.models.model_for(tier));
+            let guard = app.gateway.services().acquire("ollama").await?;
+            let r = app
+                .models
+                .chat(tier, &[Message::new("system", "Du bist JARVIS, ein hilfsbereiter lokaler Assistent. Antworte knapp auf Deutsch."), Message::new("user", prompt)], &[])
+                .await
+                .map_err(|e| e.to_string())?;
+            drop(guard);
+            println!("{}", r.content.trim());
+            eprintln!("[{} · {} Prompt-Tokens · {} Antwort-Tokens{}]", r.model, r.prompt_tokens, r.output_tokens, if r.used_fallback { " · Fallback" } else { "" });
+            Ok(())
+        }
+        Cmd::Login { provider } => {
+            if provider != "microsoft" {
+                return Err("unterstützt: microsoft".into());
+            }
+            let cfg = load_config(dir)?;
+            if cfg.microsoft.client_id.is_empty() {
+                return Err("microsoft.client_id in config.toml fehlt (siehe TOOLS.md)".into());
+            }
+            let flow = jarvis_integrations::oauth::MsDeviceCodeFlow::new(cfg.microsoft.client_id.clone(), &cfg.microsoft.tenant);
+            println!("Angefragte Berechtigungen (nur lesen): {:?}", jarvis_integrations::oauth::GRAPH_SCOPES);
+            let code = flow.start().await.map_err(|e| e.to_string())?;
+            println!("Öffne {} und gib den Code {} ein.", code.verification_uri, code.user_code);
+            let refresh = flow.complete(&code).await.map_err(|e| e.to_string())?.ok_or("kein Refresh-Token erhalten")?;
+            store_secret("ms_refresh_token", &refresh)?;
+            println!("Angemeldet. Token liegt im macOS-Schlüsselbund (Dienst JARVIS).");
+            Ok(())
+        }
+        Cmd::SetSecret { name } => {
+            let allowed = ["webuntis_password", "brave_api_key", "gmail_access_token"];
+            if !allowed.contains(&name.as_str()) {
+                return Err(format!("erlaubt: {allowed:?}"));
+            }
+            if !cfg!(target_os = "macos") {
+                return Err(format!("Schlüsselbund nur unter macOS; alternativ Umgebungsvariable JARVIS_{} setzen", name.to_uppercase()));
+            }
+            // `-w` ohne Wert: `security` fragt selbst verdeckt nach – das Geheimnis
+            // erscheint so nie in der Prozessliste oder Shell-Historie.
+            println!("Bitte den Wert für '{name}' zweimal eingeben (Eingabe bleibt unsichtbar):");
+            let st = std::process::Command::new("security")
+                .args(["add-generic-password", "-U", "-s", "JARVIS", "-a", &name, "-w"])
+                .status()
+                .map_err(|e| e.to_string())?;
+            if !st.success() {
+                return Err("Schlüsselbund-Eintrag fehlgeschlagen".into());
+            }
+            println!("Gespeichert im Schlüsselbund.");
+            Ok(())
+        }
+        Cmd::Audit { limit } => {
+            let app = build(dir, Arc::new(TerminalConfirmer))?;
+            for e in app.audit.recent(limit).map_err(|e| e.to_string())?.into_iter().rev() {
+                println!("#{:<5} {} {:<20} {:<6} {:<14} {}", e.id, e.ts, e.tool, e.origin, e.decision, e.outcome);
+            }
+            match app.audit.verify().map_err(|e| e.to_string())? {
+                Ok(n) => println!("Hash-Kette intakt ({n} Einträge)."),
+                Err(id) => println!("⚠️  Hash-Kette ab Eintrag #{id} beschädigt!"),
+            }
+            Ok(())
+        }
+        Cmd::Say { text } => {
+            let cfg = load_config(dir)?;
+            MacSay::new(cfg.voice.say_voice).speak(&text.join(" ")).await.map_err(|e| e.to_string())
+        }
+        Cmd::Transcribe { wav } => {
+            let cfg = load_config(dir)?;
+            let hw = jarvis_resources::detect_hardware();
+            let model = expand(&cfg.voice.whisper_model_dir).join(model_profile(&cfg, &hw).stt_model);
+            let t = WhisperCli::new(cfg.voice.whisper_binary, model).transcribe(Path::new(&wav)).await.map_err(|e| e.to_string())?;
+            println!("{t}");
+            Ok(())
+        }
+    }
+}
+
+async fn doctor(dir: &Path, online: bool) -> Result<(), String> {
+    println!("JARVIS Doctor – Datenordner {}\n", dir.display());
+    let app = build(dir, Arc::new(TerminalConfirmer))?;
+    let hw = &app.hardware;
+    let profile = app.models.profile();
+
+    println!("Hardware");
+    ok("System", format!("{} {} · {} · {} Kerne · {:.1} GB RAM", hw.os, hw.arch, hw.cpu_brand, hw.cpu_cores, hw.total_ram_gb));
+    if hw.os == "macos" && !hw.apple_silicon {
+        warn("Apple Silicon", "nicht erkannt (Rosetta?) – Metal-Beschleunigung fehlt");
+    }
+    let mut mon = Monitor::new();
+    let snap = mon.snapshot();
+    let mode = decide_mode(&snap);
+    ok("Ressourcen", format!("{:.1} GB frei · Akku {:?} · Thermik {:?} → Modus {mode:?}", snap.available_ram_gb, snap.battery, snap.thermal));
+    if let Ok(out) = std::process::Command::new("df").args(["-g", "/"]).output() {
+        let free = String::from_utf8_lossy(&out.stdout).lines().nth(1).and_then(|l| l.split_whitespace().nth(3).map(str::to_string)).unwrap_or_default();
+        match free.parse::<u64>() {
+            Ok(g) if g >= 30 => ok("SSD frei", format!("{g} GB")),
+            Ok(g) => warn("SSD frei", format!("{g} GB – für alle Modelle werden ≥ 30 GB empfohlen")),
+            _ => {}
+        }
+    }
+
+    println!("\nLokales LLM (Ollama)");
+    ok("Profil", format!("Haupt {} · Fallback {} · Embeddings {} · Kontext {} · KI-Budget {} GB", profile.main, profile.fallback, profile.embedding, profile.context_window, profile.ai_ram_budget_gb));
+    match which("ollama") {
+        Some(p) => ok("ollama", p),
+        None => fail("ollama", "nicht installiert → scripts/setup-mac.sh"),
+    }
+    match app.models.load().await {
+        Ok(()) => {
+            ok("Server", app.models.client().version().await.unwrap_or_default());
+            match app.models.missing_models().await {
+                Ok(m) if m.is_empty() => ok("Modelle", "alle installiert"),
+                Ok(m) => warn("Modelle", format!("fehlen: {} → scripts/setup-mac.sh", m.join(", "))),
+                Err(e) => fail("Modelle", e),
+            }
+            let missing = app.models.missing_models().await.unwrap_or_default();
+            if !missing.contains(&profile.fallback) {
+                let t = std::time::Instant::now();
+                match app.models.chat(jarvis_context::ModelTier::LocalSmall, &[Message::new("user", "Antworte nur mit dem Wort OK.")], &[]).await {
+                    Ok(r) => ok("Testanfrage", format!("{} antwortet '{}' in {:.1}s", r.model, r.content.trim().chars().take(40).collect::<String>(), t.elapsed().as_secs_f32())),
+                    Err(e) => fail("Testanfrage", e),
+                }
+            }
+            let _ = app.models.unload().await;
+            ok("Entladen", "Modell und ggf. gestarteter Server wieder beendet");
+        }
+        Err(e) => fail("Server", e),
+    }
+
+    println!("\nMemory (SQLite)");
+    app.memory.set_preference("doctor_check", "ok").map_err(|e| e.to_string())?;
+    ok("brain.db", format!("Schema v{} · Lesen/Schreiben ok", app.memory.schema_version().map_err(|e| e.to_string())?));
+    match app.audit.verify().map_err(|e| e.to_string())? {
+        Ok(n) => ok("Audit-Log", format!("Hash-Kette intakt ({n} Einträge)")),
+        Err(id) => fail("Audit-Log", format!("beschädigt ab #{id}")),
+    }
+
+    println!("\nDateisystem");
+    for r in &app.config.filesystem.roots {
+        let p = expand(r);
+        if p.exists() {
+            ok("Freigabe", p.display());
+        } else {
+            warn("Freigabe", format!("{} existiert nicht", p.display()));
+        }
+    }
+    match app.gateway.invoke("fs_search", serde_json::json!({"pattern": "*.pdf", "limit": 3}), Origin::User).await {
+        Ok(o) => ok("fs_search", o.text.lines().next().unwrap_or("")),
+        Err(e) => warn("fs_search", format!("{e} (macOS: Terminal Zugriff auf Ordner erlauben)")),
+    }
+
+    println!("\nSicherheit");
+    for a in ["send_email", "delete_email", "send_teams_message", "edit_teams_message", "modify_webuntis"] {
+        match app.gateway.invoke(a, serde_json::json!({}), Origin::Agent).await {
+            Err(jarvis_runtime::GatewayError::HardDenied(_)) => ok(a, "blockiert"),
+            other => fail(a, format!("NICHT blockiert: {other:?}")),
+        }
+    }
+
+    println!("\nVoice");
+    let cfg = &app.config;
+    match which(&cfg.voice.whisper_binary) {
+        Some(p) => ok("whisper.cpp", p),
+        None => warn("whisper.cpp", "nicht installiert → scripts/setup-mac.sh"),
+    }
+    let mdir = expand(&cfg.voice.whisper_model_dir);
+    let mut stt = vec![&profile.stt_model];
+    if profile.stt_fallback != profile.stt_model {
+        stt.push(&profile.stt_fallback);
+    }
+    for m in stt {
+        if mdir.join(m).exists() {
+            ok("Whisper-Modell", m);
+        } else {
+            warn("Whisper-Modell", format!("{m} fehlt in {}", mdir.display()));
+        }
+    }
+    match which("say") {
+        Some(_) => {
+            let out = std::process::Command::new("say").args(["-v", "?"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+            let de: Vec<&str> = out.lines().filter(|l| l.contains("de_")).filter_map(|l| l.split_whitespace().next()).collect();
+            if de.iter().any(|v| *v == cfg.voice.say_voice) {
+                ok("macOS TTS", format!("Stimme {} vorhanden", cfg.voice.say_voice))
+            } else {
+                warn("macOS TTS", format!("Stimme {} fehlt; deutsche Stimmen: {de:?}", cfg.voice.say_voice))
+            }
+        }
+        None => warn("macOS TTS", "'say' nicht gefunden (kein macOS?)"),
+    }
+
+    println!("\nWeb / Recherche");
+    ok("Suchanbieter", format!("{:?}", app.research.provider_ids()));
+    if online {
+        match app.gateway.invoke("web_search", serde_json::json!({"query": "Tauri Framework", "count": 3}), Origin::User).await {
+            Ok(o) => ok("web_search", o.text.lines().next().unwrap_or("")),
+            Err(e) => fail("web_search", e),
+        }
+    } else {
+        warn("web_search", "übersprungen (mit --online testen)");
+    }
+
+    println!("\nRead-only-Integrationen");
+    let names = app.gateway.registry().names();
+    let probes = [("email", "email_recent", serde_json::json!({"limit": 3})), ("teams", "teams_chats", serde_json::json!({"limit": 3})), ("webuntis", "webuntis_timetable", serde_json::json!({}))];
+    for (label, tool, args) in probes {
+        if !names.contains(&tool) {
+            let why = app.inactive.iter().find(|(i, _)| i == label).map(|(_, w)| w.as_str()).unwrap_or("inaktiv");
+            warn(label, why);
+        } else if online {
+            match app.gateway.invoke(tool, args, Origin::User).await {
+                Ok(o) => ok(label, format!("{} Zeilen gelesen", o.text.lines().count())),
+                Err(e) => fail(label, e),
+            }
+        } else {
+            ok(label, "konfiguriert (mit --online live testen)");
+        }
+    }
+    println!("\nFertig. Details im Audit-Log: `jarvis audit`.");
+    Ok(())
+}

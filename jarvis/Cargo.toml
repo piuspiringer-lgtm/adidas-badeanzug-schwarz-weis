@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+jarvis-permissions = { path = "crates/jarvis-permissions" }
+jarvis-runtime = { path = "crates/jarvis-runtime" }
+jarvis-memory = { path = "crates/jarvis-memory" }
+jarvis-context = { path = "crates/jarvis-context" }
+jarvis-models = { path = "crates/jarvis-models" }
+jarvis-resources = { path = "crates/jarvis-resources" }
+jarvis-integrations = { path = "crates/jarvis-integrations" }
+jarvis-voice = { path = "crates/jarvis-voice" }
+
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+hex = "0.4"
+url = "2"
+scraper = "0.20"
+sysinfo = "0.32"
+walkdir = "2"
+globset = "0.4"
+trash = "5"
+dirs = "5"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+wiremock = "0.6"
+tempfile = "3"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

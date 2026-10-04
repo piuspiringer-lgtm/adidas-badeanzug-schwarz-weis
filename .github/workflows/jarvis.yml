@@ -1,0 +1,34 @@
+name: JARVIS
+
+on:
+  push:
+    paths: ["jarvis/**", ".github/workflows/jarvis.yml"]
+  pull_request:
+    paths: ["jarvis/**", ".github/workflows/jarvis.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: jarvis
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: jarvis
+      - name: Sicherheits-Pflichttests
+        run: cargo test -p jarvis-permissions -p jarvis-runtime && cargo test -p jarvis-integrations --test security
+      - name: Alle Tests
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
