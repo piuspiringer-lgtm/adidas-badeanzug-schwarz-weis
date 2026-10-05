@@ -202,10 +202,15 @@ async fn voice_start(core: State<'_, Core>) -> Result<(), String> {
         return Err(r);
     }
     core.tts.stop().await; // JARVIS unterbrechen, wenn du sprichst
-    let mut rec = core.recording.lock().unwrap();
-    if rec.is_none() {
-        *rec = Some(jarvis_voice::capture::Recording::start().map_err(|e| e.to_string())?);
+    if core.recording.lock().unwrap().is_some() {
+        return Ok(());
     }
+    // Gerätestart kann kurz blockieren → nicht auf dem Async-Thread.
+    let rec = tauri::async_runtime::spawn_blocking(jarvis_voice::capture::Recording::start)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    core.recording.lock().unwrap().get_or_insert(rec);
     Ok(())
 }
 
