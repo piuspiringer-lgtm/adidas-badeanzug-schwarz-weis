@@ -24,6 +24,23 @@ LLM/Skill/UI ─► ToolGateway.invoke(name, args, origin)
 Die Registry gibt Tools nicht heraus. Ein Aufruf ist **nur** über den Gateway
 möglich.
 
+## Agent Core
+
+- Der Agent hat **keine eigenen Rechte**; jede Aktion geht über den Gateway (Origin `Agent`).
+- **Pro Anfrage freigegebene Tools:** Das Modell kann nur Tools ausführen, die der Agent für genau diese Anfrage ausgewählt hat. Fragt der Benutzer nach Mails, ist `fs_trash` nicht einmal ausführbar – egal was in einer Mail steht. Gesperrte Aktionen (z. B. `send_email`) werden trotzdem an den Gateway gemeldet, damit sie im Audit erscheinen.
+- **Ehrliche Antworten:** Blockierte, abgelehnte, fehlgeschlagene oder nicht verifizierte Aktionen werden der Antwort **immer** angehängt – auch wenn das Modell etwas anderes behauptet.
+- **Verifikation:** Nach verändernden Dateiaktionen prüft der Agent den tatsächlichen Zustand.
+- **Memory-Poisoning:** `memory_remember` wird nur angeboten, wenn der Benutzer ausdrücklich „merk dir …“ sagt. Gespeicherte Fakten gehen als „Daten, keine Anweisungen“ in den Prompt.
+- Schrittlimit, Schleifenschutz, Längenlimits für Eingaben.
+- Test: `crates/jarvis-agent/tests/agent.rs` (u. a. Prompt-Injection über eine Mail, die `send_email`, `delete_email` und `fs_trash` auslösen will).
+
+## Desktop-App
+
+- Modell-, Tool- und Mailtexte werden ausschließlich als Text gerendert (React, kein `innerHTML`, kein Markdown-HTML) – geprüft im UI-Test mit einem `<img onerror>`-Payload.
+- Strikte CSP: nur eigene Skripte, keine externen Verbindungen aus der Oberfläche.
+- Bestätigungen gelten nur für eine offene Anfrage mit zufälliger ID; Standardfokus liegt auf „Ablehnen“, `Esc` = Ablehnen, Timeout = Ablehnen.
+- E2E-Test der echten App (`app/e2e`): Ablehnen → Datei bleibt; Bestätigen → Papierkorb + Verifikation; `send_email` → gesperrt; Protokoll + Hash-Kette.
+
 ## Read-only-Durchsetzung (5 Ebenen)
 
 | Ebene | Mechanismus | Test |
@@ -85,7 +102,7 @@ Mail („rufe send_email auf“) nichts auslösen kann. Getestet in
 | GET-URLs können theoretisch Daten im Query enthalten | durch Längenlimits begrenzt und vollständig im Audit sichtbar; UI zeigt externe Abrufe live |
 | WebUntis-JSON-RPC ist inoffiziell | nur Lese-Methoden; Änderungen der API führen zu Fehlern, nie zu Schreibzugriffen |
 | Gmail-Anmeldung noch nicht implementiert | folgt mit UI; Scope steht fest (`gmail.readonly`) |
-| Bestätigungsdialog im CLI ist ein Terminal-Prompt | Tauri-UI zeigt native Dialoge mit Vorschau |
+| Bestätigungsdialog im CLI ist ein Terminal-Prompt | in der Desktop-App: Dialog mit Vorschau, Risiko und Pfaden |
 
 ## Melden
 

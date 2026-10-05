@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  rust:
     strategy:
       matrix:
         os: [macos-latest, ubuntu-latest]
@@ -20,15 +20,59 @@ jobs:
         working-directory: jarvis
     steps:
       - uses: actions/checkout@v4
+      - name: Linux-Abhängigkeiten für Tauri
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libsoup-3.0-dev libayatana-appindicator3-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: jarvis
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: jarvis/app/package-lock.json
+      - name: Oberfläche bauen (wird in die App eingebettet)
+        working-directory: jarvis/app
+        run: npm ci && npm run build
       - name: Sicherheits-Pflichttests
-        run: cargo test -p jarvis-permissions -p jarvis-runtime && cargo test -p jarvis-integrations --test security
+        run: cargo test -p jarvis-permissions -p jarvis-runtime && cargo test -p jarvis-integrations --test security && cargo test -p jarvis-agent --test agent
       - name: Alle Tests
         run: cargo test --workspace
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  ui-e2e:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: jarvis
+    steps:
+      - uses: actions/checkout@v4
+      - name: Systempakete
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libsoup-3.0-dev libayatana-appindicator3-dev webkit2gtk-driver xvfb
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: jarvis
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: jarvis/app/package-lock.json
+      - name: UI-Tests (TypeScript, Vitest)
+        working-directory: jarvis/app
+        run: npm ci && npx tsc -b && npm test && npm run build
+      - name: Desktop-App bauen
+        run: cargo build -p jarvis-desktop --features custom-protocol
+      - name: E2E-Werkzeuge
+        run: cargo install tauri-driver --locked && pip install selenium
+      - name: E2E-Test der echten App
+        run: app/e2e/run.sh ../../target/debug/jarvis-desktop ./screenshots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-screenshots
+          path: jarvis/app/e2e/screenshots

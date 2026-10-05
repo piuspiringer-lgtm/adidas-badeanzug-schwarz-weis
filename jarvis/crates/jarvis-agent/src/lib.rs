@@ -272,6 +272,9 @@ impl Agent {
 
         let mut prompt_tokens = 0;
         let mut output_tokens = 0;
+        // Tatsächlich antwortendes Modell (kann vom geplanten abweichen,
+        // z. B. wenn das geladene Hauptmodell wiederverwendet wird).
+        let mut model = model;
 
         // ---------- plan ----------
         let plan = if complexity == Complexity::Complex && !offered.is_empty() {
@@ -327,6 +330,9 @@ impl Agent {
             };
             prompt_tokens += reply.prompt_tokens;
             output_tokens += reply.output_tokens;
+            if !reply.model.is_empty() {
+                model = reply.model.clone();
+            }
 
             if reply.tool_calls.is_empty() {
                 // ---------- verify ----------

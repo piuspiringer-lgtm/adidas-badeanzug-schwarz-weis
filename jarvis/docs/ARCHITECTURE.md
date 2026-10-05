@@ -15,16 +15,36 @@ jarvis-memory   jarvis-context      jarvis-resources
    └────────── jarvis-cli (App-Zusammenbau, später Tauri) ── jarvis-voice
 ```
 
-## Datenfluss einer Anfrage (Zielbild Phase 1)
+## Agent Core (`jarvis-agent`)
 
-1. Eingabe (Text oder Push-to-Talk → whisper.cpp).
-2. **Context Manager:** Aufgabe klassifizieren (einfach/normal/komplex) → Modellstufe. Der Ressourcenmodus kann das kleine Modell erzwingen.
-3. **Tool-Vorauswahl:** wenige passende Tools (Memory: Erfolgsquoten, Workflows) statt aller Tools im Prompt.
-4. **Model Manager:** Chat mit Tool-Calls (Ollama), Fallback bei Fehlern.
-5. **Gateway:** Jeder Tool-Call durchläuft Sperrliste → Policy → Bestätigung → Lifecycle → Ausführung → Audit.
-6. **Context Manager:** Tool-Ausgaben kürzen bzw. zusammenfassen, bevor sie zurück ins Modell gehen. Den Verlauf bei Bedarf komprimieren.
-7. **Memory:** Erfolg oder Fehler, Dauer und Lösung speichern (Grundlage für Ranking).
-8. Antwort → UI / TTS.
+| Phase | Was passiert | Verbunden mit |
+|---|---|---|
+| **understand** | Ressourcenmodus lesen → Modellgröße/keep_alive setzen; Absicht (Intent-Schlüssel) und Komplexität bestimmen | Resource Manager, Context Router |
+| **tool selection** | 3–8 passende Tools je Anfrage (deutsche Wortstämme, Tool-Familien, Erfolgsquoten, bewährte Workflows). Smalltalk → keine Tools, keine Schemas im Prompt | Tool Registry, Memory (`tool_stats`, `workflows`) |
+| **plan** | nur bei komplexen Aufgaben: kurzer Plan (≤ 5 Schritte) als eigener Modellaufruf | Model Manager |
+| **execute** | Tool-Calls des Modells (Ollama-Format, Fallback `<tool_call>`) → **ToolGateway** (Sperrliste → Policy → Bestätigung → Lifecycle → Audit). Nur für diese Anfrage ausgewählte Tools sind ausführbar | Gateway, Permission Layer, Lifecycle |
+| **observe** | Ausgaben gekürzt (Token-Budget), Fehler mit bekannter Lösung aus Memory angereichert; Ablehnungen als „nicht erneut versuchen“ | Context Manager, Memory |
+| **verify** | deterministische Nachbedingungen (Datei existiert / liegt im Papierkorb / wurde verschoben); bei Abweichung eine Korrekturrunde | Dateisystem |
+| **finish** | Antwort + Pflicht-Hinweise zu blockierten/abgelehnten/fehlgeschlagenen Aktionen; Lernen (Workflow, Tool-Statistik, Fehler→Lösung); Verlauf komprimiert speichern; im Modus „Kritisch“ Dienste sofort entladen | Memory, Lifecycle |
+
+Schutzmechanismen im Ablauf: Schrittlimit (8), max. 4 Tool-Calls pro Schritt,
+doppelte Aufrufe werden übersprungen, Verlauf wird nie zwischen Tool-Aufruf
+und Tool-Ergebnis abgeschnitten.
+
+## Desktop-App (`app/`)
+
+Tauri 2 + React 18 + TypeScript, ohne UI-Bibliotheken (klein, offline).
+Die Rust-Seite (`app/src-tauri`) ist eine dünne Schicht über `jarvis_app::App`:
+
+| Befehl / Event | Zweck |
+|---|---|
+| `send_message` | Agent-Lauf; immer nur einer gleichzeitig |
+| `agent-event` (Event) | jede Phase, jeder Tool-Aufruf, jedes Ergebnis live in der Oberfläche |
+| `confirm-request` / `confirm_response` | nativer Bestätigungsdialog (zufällige ID, 2 Min. Timeout = Nein) |
+| `system_status` | Hardware, RAM/CPU/Akku, Modus, Modelle, Dienste (alle 5 s, nur bei sichtbarem Fenster) |
+| `list_tools`, `audit_log` | Werkzeuge mit Rechten; Protokoll inkl. Hash-Ketten-Prüfung |
+
+Beim Schließen des Fensters werden alle Dienste (Ollama) entladen.
 
 ## Lifecycle
 
@@ -67,7 +87,7 @@ Modelle lassen sich in `config.toml` überschreiben oder zur Laufzeit per
 
 ## Nächste Phasen
 
-1. Agent-Kern (Planen → Tool-Calls → Reflektieren) + Tauri/React-UI mit Bestätigungsdialogen und Live-Audit
+1. Voice an den Agenten anbinden (Push-to-Talk in der App → whisper.cpp → Agent → TTS)
 2. Embeddings (sqlite-vec) für Memory und Tool-Retrieval
 3. Gmail-Anmeldung, native Keychain-API
 4. Workflows/Skills lernen, MCP-Brücke (optional)

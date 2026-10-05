@@ -211,6 +211,10 @@ impl ModelManager {
             return s.profile.fallback.clone();
         }
         match tier {
+            // Ist das Hauptmodell bereits geladen, beantwortet es auch einfache
+            // Fragen: ein Modellwechsel (entladen + ~2,5 GB von der SSD laden)
+            // kostet mehr Zeit und Akku, als das kleinere Modell spart.
+            ModelTier::LocalSmall if self.current.lock().unwrap().as_deref() == Some(s.profile.main.as_str()) => s.profile.main.clone(),
             ModelTier::LocalSmall => s.profile.fallback.clone(),
             // "Strong" ist ohne explizite Konfiguration das lokale Hauptmodell.
             ModelTier::LocalMain | ModelTier::Strong => s.profile.main.clone(),
@@ -233,15 +237,7 @@ impl ModelManager {
             let s = self.settings.lock().unwrap();
             (s.profile.context_window, s.keep_alive_secs, s.profile.fallback.clone())
         };
-        let mut model = self.model_for(tier);
-        // Ist das Hauptmodell bereits geladen, beantwortet es auch einfache
-        // Fragen: ein Modellwechsel (entladen + ~2,5 GB von der SSD laden)
-        // kostet mehr Zeit und Akku, als das kleinere Modell spart.
-        let force = *self.force_fallback.lock().unwrap();
-        let current = self.current.lock().unwrap().clone();
-        if tier == ModelTier::LocalSmall && !force && current.as_deref() == Some(self.profile().main.as_str()) {
-            model = self.profile().main;
-        }
+        let model = self.model_for(tier);
         let think = tier == ModelTier::Strong;
         self.switch_to(&model).await;
         match self.client.chat(&model, messages, tools, ctx, keep, think).await {
