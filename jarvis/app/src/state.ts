@@ -10,7 +10,7 @@ export type ActivityItem =
   | { id: number; kind: "call"; tool: string; args: string; status?: StepStatus; summary?: string; verified?: { ok: boolean; detail: string } }
   | { id: number; kind: "error"; text: string };
 
-export type ReactorState = "idle" | "thinking" | "acting" | "waiting" | "error";
+export type ReactorState = "idle" | "listening" | "transcribing" | "thinking" | "acting" | "waiting" | "error";
 
 export interface UiState {
   messages: ChatMessage[];
@@ -28,6 +28,7 @@ export type Action =
   | { type: "reply"; text: string; meta: string }
   | { type: "failure"; text: string }
   | { type: "waiting"; on: boolean }
+  | { type: "voice"; state: "listening" | "transcribing" | "idle" }
   | { type: "reset" };
 
 const PHASE_LABEL: Record<Phase, string> = {
@@ -61,6 +62,8 @@ export function reducer(s: UiState, a: Action): UiState {
       return { ...s, nextId: id + 1, messages: [...s.messages, { id, role: "jarvis", text: a.text, meta: a.meta }], reactor: "idle", phase: null };
     case "failure":
       return { ...s, nextId: id + 1, messages: [...s.messages, { id, role: "system", text: a.text }], reactor: "error", phase: null };
+    case "voice":
+      return { ...s, reactor: a.state };
     case "waiting":
       return { ...s, reactor: a.on ? "waiting" : "acting" };
     case "reset":

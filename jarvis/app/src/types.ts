@@ -69,6 +69,7 @@ export interface Status {
   inactive: [string, string][];
   fs_roots: string[];
   busy: boolean;
+  voice: { available: boolean; reason: string | null; stt_model: string | null; recording: boolean };
 }
 
 export interface ToolInfo {

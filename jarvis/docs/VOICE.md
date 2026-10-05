@@ -15,12 +15,27 @@ Sicherheit: Für das Modell gibt es kein Tool, das das Mikrofon einschaltet. Tex
 geht per stdin an `say`/Piper und wird nie als Kommandozeilenargument
 interpretiert.
 
-Testen auf dem Mac:
+## In der Desktop-App (an den Agent Core angebunden)
+
+1. **Sprechtaste** (Mikrofon-Symbol) gedrückt halten – oder **⌥ + Leertaste** halten.
+   Der Reactor wird grün („Hört zu“). Spricht JARVIS gerade, wird er unterbrochen.
+2. Loslassen → Aufnahme endet (max. 60 s), wird auf 16 kHz mono umgerechnet und
+   **lokal** von whisper.cpp transkribiert („Versteht“). Die WAV-Datei wird sofort gelöscht.
+3. Das Transkript geht als normale Anfrage an den Agenten – mit allen Regeln
+   (Tool-Auswahl, Bestätigungen, Read-only, Audit).
+4. Die Antwort wird vorgelesen (`say`, Stimme aus `config.toml`). Markdown und
+   Links werden nicht vorgelesen; bei nicht ausgeführten Aktionen kommt ein kurzer Hinweis.
+
+Modellwahl: das erste **vorhandene** Modell in der Reihenfolge des Profils
+(Turbo → Small; im Modus „Sparen“ Small zuerst). Fehlt Turbo, wird Small genutzt –
+es wird nichts automatisch heruntergeladen. Im Modus „Kritisch“ ist Sprache pausiert.
+
+macOS fragt beim ersten Druck auf die Sprechtaste nach der Mikrofon-Berechtigung
+(Begründung in `app/src-tauri/Info.plist`).
+
+## Im Terminal
 
 ```bash
 jarvis say "Hallo, ich bin JARVIS."
-# Aufnahme (16 kHz mono) z. B. mit: ffmpeg -f avfoundation -i ":0" -ar 16000 -ac 1 -t 5 test.wav
-jarvis transcribe test.wav
+jarvis transcribe aufnahme.wav      # nutzt Turbo, sonst Small
 ```
-
-Die Audioaufnahme selbst (Mikrofon → WAV) kommt mit der Tauri-UI (Phase 1).

@@ -41,6 +41,7 @@ clap = { version = "4", features = ["derive"] }
 wiremock = "0.6"
 tempfile = "3"
 base64 = "0.22"
+cpal = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # Schonung der SSD: Debug-Infos nur für eigenen Code (Zeilennummern),

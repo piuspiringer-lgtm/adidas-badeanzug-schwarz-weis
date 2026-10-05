@@ -14,6 +14,7 @@ use jarvis_agent::{Agent, AgentEvent, Outcome};
 use jarvis_app::App;
 use jarvis_permissions::{CallFacts, ToolSpec};
 use jarvis_runtime::Confirmer;
+use jarvis_voice::TextToSpeech;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -80,6 +81,8 @@ impl Confirmer for UiConfirmer {
 
 struct Core {
     app: App,
+    recording: Mutex<Option<jarvis_voice::capture::Recording>>,
+    tts: Arc<jarvis_voice::MacSay>,
     agent: Arc<Agent>,
     confirmer: Arc<UiConfirmer>,
     busy: tokio::sync::Mutex<()>,
@@ -96,6 +99,46 @@ struct Status {
     inactive: Vec<(String, String)>,
     fs_roots: Vec<String>,
     busy: bool,
+    voice: VoiceStatus,
+}
+
+#[derive(Serialize)]
+struct VoiceStatus {
+    available: bool,
+    reason: Option<String>,
+    stt_model: Option<String>,
+    recording: bool,
+}
+
+impl Core {
+    /// Whisper-Modell passend zum Ressourcenmodus (das erste vorhandene).
+    fn stt_model(&self, mode: jarvis_resources::Mode) -> Option<std::path::PathBuf> {
+        let p = self.app.models.profile();
+        let order: [&str; 2] = if jarvis_resources::settings_for(mode).use_stt_fallback {
+            [&p.stt_fallback, &p.stt_model]
+        } else {
+            [&p.stt_model, &p.stt_fallback]
+        };
+        jarvis_voice::pick_stt_model(&jarvis_app::expand(&self.app.config.voice.whisper_model_dir), &order)
+    }
+
+    fn voice_status(&self, mode: jarvis_resources::Mode) -> VoiceStatus {
+        let recording = self.recording.lock().unwrap().is_some();
+        let model = self.stt_model(mode);
+        let reason = if !jarvis_resources::settings_for(mode).voice_enabled {
+            Some("Sprachsteuerung im Modus „Kritisch“ pausiert (Akku/Temperatur)".to_string())
+        } else if model.is_none() {
+            Some(format!("Kein Whisper-Modell in {}", self.app.config.voice.whisper_model_dir))
+        } else {
+            None
+        };
+        VoiceStatus {
+            available: reason.is_none(),
+            reason,
+            stt_model: model.and_then(|m| m.file_name().map(|f| f.to_string_lossy().into_owned())),
+            recording,
+        }
+    }
 }
 
 #[tauri::command]
@@ -131,9 +174,11 @@ async fn reset_conversation(core: State<'_, Core>) -> Result<(), String> {
 #[tauri::command]
 fn system_status(core: State<'_, Core>) -> Status {
     let snapshot = core.monitor.lock().unwrap().snapshot();
+    let mode = jarvis_resources::decide_mode(&snapshot);
     Status {
+        voice: core.voice_status(mode),
         hardware: core.app.hardware.clone(),
-        mode: jarvis_resources::decide_mode(&snapshot),
+        mode,
         snapshot,
         profile: core.app.models.profile(),
         services: core.app.gateway.services().status(),
@@ -146,6 +191,60 @@ fn system_status(core: State<'_, Core>) -> Status {
 #[tauri::command]
 fn list_tools(core: State<'_, Core>) -> Vec<jarvis_runtime::tool::ToolInfo> {
     core.app.gateway.registry().list()
+}
+
+/// Push-to-Talk gedrückt: Aufnahme starten. Nur die Oberfläche ruft das
+/// auf eine Benutzergeste hin auf – für das Modell gibt es kein solches Tool.
+#[tauri::command]
+async fn voice_start(core: State<'_, Core>) -> Result<(), String> {
+    let mode = jarvis_resources::decide_mode(&core.monitor.lock().unwrap().snapshot());
+    if let Some(r) = core.voice_status(mode).reason {
+        return Err(r);
+    }
+    core.tts.stop().await; // JARVIS unterbrechen, wenn du sprichst
+    let mut rec = core.recording.lock().unwrap();
+    if rec.is_none() {
+        *rec = Some(jarvis_voice::capture::Recording::start().map_err(|e| e.to_string())?);
+    }
+    Ok(())
+}
+
+/// Push-to-Talk losgelassen: Aufnahme beenden und lokal transkribieren.
+#[tauri::command]
+async fn voice_stop(core: State<'_, Core>) -> Result<String, String> {
+    let rec = core.recording.lock().unwrap().take().ok_or("Keine laufende Aufnahme")?;
+    let samples = tauri::async_runtime::spawn_blocking(move || rec.stop()).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    if samples.len() < (jarvis_voice::capture::TARGET_RATE as usize) / 3 || jarvis_voice::capture::rms(&samples) < 0.003 {
+        return Ok(String::new()); // zu kurz oder Stille
+    }
+    let mode = jarvis_resources::decide_mode(&core.monitor.lock().unwrap().snapshot());
+    let model = core.stt_model(mode).ok_or("Kein Whisper-Modell gefunden")?;
+    let dir = std::env::temp_dir().join(format!("jarvis-voice-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let wav = dir.join("ptt.wav");
+    jarvis_voice::capture::write_wav(&wav, &samples, jarvis_voice::capture::TARGET_RATE).map_err(|e| e.to_string())?;
+    let stt = jarvis_voice::WhisperCli::new(core.app.config.voice.whisper_binary.clone(), model);
+    let text = jarvis_voice::SpeechToText::transcribe(&stt, &wav).await;
+    let _ = std::fs::remove_file(&wav); // Aufnahme nicht aufbewahren
+    text.map_err(|e| e.to_string())
+}
+
+/// Antwort vorlesen (macOS-Stimme). Wird durch Push-to-Talk unterbrochen.
+#[tauri::command]
+async fn speak(text: String, core: State<'_, Core>) -> Result<(), String> {
+    let mode = jarvis_resources::decide_mode(&core.monitor.lock().unwrap().snapshot());
+    if !jarvis_resources::settings_for(mode).voice_enabled {
+        return Ok(());
+    }
+    let t = jarvis_voice::speakable(&text);
+    let tts = core.tts.clone();
+    tts.speak(&t).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stop_speaking(core: State<'_, Core>) -> Result<(), String> {
+    core.tts.stop().await;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -181,7 +280,10 @@ fn main() {
             let app = jarvis_app::build(&dir, confirmer.clone())?;
             // Reaper und Agent im Tokio-Kontext von Tauri anlegen.
             let agent = Arc::new(tauri::async_runtime::block_on(async { app.agent() }));
+            let tts = Arc::new(jarvis_voice::MacSay::new(app.config.voice.say_voice.clone()));
             tauri_app.manage(Core {
+                recording: Mutex::new(None),
+                tts,
                 app,
                 agent,
                 confirmer,
@@ -201,7 +303,19 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![send_message, confirm_response, reset_conversation, system_status, list_tools, audit_log, memory_overview])
+        .invoke_handler(tauri::generate_handler![
+            send_message,
+            confirm_response,
+            reset_conversation,
+            system_status,
+            list_tools,
+            audit_log,
+            memory_overview,
+            voice_start,
+            voice_stop,
+            speak,
+            stop_speaking
+        ])
         .run(tauri::generate_context!())
         .expect("JARVIS konnte nicht gestartet werden");
 }

@@ -22,9 +22,9 @@ d.set_window_size(1320, 840)
 
 def send(text):
     box = wait.until(lambda d: d.find_element(By.CSS_SELECTOR, "textarea[aria-label='Nachricht an JARVIS']"))
-    wait.until(lambda d: box.is_enabled() and not d.find_elements(By.CSS_SELECTOR, ".chat__input button[disabled]") or box.get_attribute("value") == "")
+    wait.until(lambda d: box.is_enabled() and not d.find_elements(By.CSS_SELECTOR, ".chat__input button[type=submit][disabled]") or box.get_attribute("value") == "")
     box.send_keys(text)
-    d.find_element(By.CSS_SELECTOR, ".chat__input button").click()
+    d.find_element(By.CSS_SELECTOR, ".chat__input button[type=submit]").click()
 
 def last_answer(contains):
     return wait.until(lambda d: next((m.text for m in d.find_elements(By.CSS_SELECTOR, ".msg--jarvis p") if contains in m.text), None))
@@ -43,6 +43,9 @@ try:
     wait.until(lambda d: "qwen3:8b" in d.find_element(By.CSS_SELECTOR, ".status").text)
     d.save_screenshot(str(SHOTS / "1-start.png"))
     check(True, "App gestartet, Status vom Rust-Kern geladen")
+
+    mic = d.find_element(By.CSS_SELECTOR, "button.mic")
+    check(not mic.is_enabled() and "Whisper-Modell" in (mic.get_attribute("title") or ""), "Sprechtaste ohne Whisper-Modell gesperrt, Grund sichtbar")
 
     send("Hallo JARVIS")
     check("Hallo! Ich bin JARVIS." in last_answer("Hallo"), "Smalltalk über den Agenten")

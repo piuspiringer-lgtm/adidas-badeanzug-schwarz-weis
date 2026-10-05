@@ -16,6 +16,7 @@ jarvis-runtime.workspace = true
 jarvis-permissions.workspace = true
 jarvis-resources.workspace = true
 jarvis-memory.workspace = true
+jarvis-voice.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 serde.workspace = true

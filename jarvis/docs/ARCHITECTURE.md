@@ -43,6 +43,8 @@ Die Rust-Seite (`app/src-tauri`) ist eine dünne Schicht über `jarvis_app::App`
 | `confirm-request` / `confirm_response` | nativer Bestätigungsdialog (zufällige ID, 2 Min. Timeout = Nein) |
 | `system_status` | Hardware, RAM/CPU/Akku, Modus, Modelle, Dienste (alle 5 s, nur bei sichtbarem Fenster) |
 | `list_tools`, `audit_log` | Werkzeuge mit Rechten; Protokoll inkl. Hash-Ketten-Prüfung |
+| `voice_start` / `voice_stop` | Push-to-Talk: native Aufnahme (cpal) → whisper.cpp → Transkript → `send_message` |
+| `speak` / `stop_speaking` | Antwort vorlesen (macOS `say`), unterbrechbar |
 
 Beim Schließen des Fensters werden alle Dienste (Ollama) entladen.
 
@@ -87,7 +89,7 @@ Modelle lassen sich in `config.toml` überschreiben oder zur Laufzeit per
 
 ## Nächste Phasen
 
-1. Voice an den Agenten anbinden (Push-to-Talk in der App → whisper.cpp → Agent → TTS)
+1. Websuche-Netzwerkfehler auf dem Mac analysieren; E-Mail/Teams/WebUntis einrichten
 2. Embeddings (sqlite-vec) für Memory und Tool-Retrieval
 3. Gmail-Anmeldung, native Keychain-API
 4. Workflows/Skills lernen, MCP-Brücke (optional)

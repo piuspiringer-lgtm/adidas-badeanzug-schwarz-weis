@@ -15,6 +15,7 @@ export default function App() {
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [audit, setAudit] = useState<AuditView | null>(null);
   const [confirms, setConfirms] = useState<ConfirmRequest[]>([]);
+  const [talking, setTalking] = useState(false);
 
   useEffect(() => {
     getBackend().then(setBackend);
@@ -61,7 +62,7 @@ export default function App() {
     if (tab === "audit") refreshAudit();
   }, [tab, refreshAudit]);
 
-  const send = async (text: string) => {
+  const send = async (text: string, spoken = false) => {
     if (!backend) return;
     dispatch({ type: "user", text });
     setBusy(true);
@@ -70,6 +71,7 @@ export default function App() {
       const secs = (out.duration_ms / 1000).toFixed(1);
       const meta = `${out.model} · ${out.steps.length} Schritt${out.steps.length === 1 ? "" : "e"} · ${secs} s`;
       dispatch({ type: "reply", text: out.answer, meta });
+      if (spoken) backend.speak(out.answer).catch(() => {});
     } catch (e) {
       dispatch({ type: "failure", text: String(e) });
     } finally {
@@ -91,6 +93,56 @@ export default function App() {
     await backend?.reset();
     dispatch({ type: "reset" });
   };
+
+  // Push-to-Talk: Aufnahme nur, solange die Taste gehalten wird.
+  const startTalk = useCallback(async () => {
+    if (!backend || busy || talking || !status?.voice.available) return;
+    try {
+      await backend.voiceStart();
+      setTalking(true);
+      dispatch({ type: "voice", state: "listening" });
+    } catch (e) {
+      dispatch({ type: "failure", text: String(e) });
+    }
+  }, [backend, busy, talking, status]);
+
+  const stopTalk = useCallback(async () => {
+    if (!backend || !talking) return;
+    setTalking(false);
+    dispatch({ type: "voice", state: "transcribing" });
+    try {
+      const text = (await backend.voiceStop()).trim();
+      if (!text) {
+        dispatch({ type: "voice", state: "idle" });
+        return;
+      }
+      await send(text, true);
+    } catch (e) {
+      dispatch({ type: "failure", text: String(e) });
+    }
+    // `send` nutzt nur stabile Referenzen (backend, dispatch).
+  }, [backend, talking]);
+
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => {
+      if (e.code === "Space" && e.altKey && !e.repeat) {
+        e.preventDefault();
+        startTalk();
+      }
+    };
+    const up = (e: KeyboardEvent) => {
+      if (talking && (e.code === "Space" || e.key === "Alt")) {
+        e.preventDefault();
+        stopTalk();
+      }
+    };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+    };
+  }, [startTalk, stopTalk, talking]);
 
   const current = confirms[0];
 
@@ -125,7 +177,18 @@ export default function App() {
               <PhaseTrack current={ui.phase} />
             </div>
           </header>
-          <Chat messages={ui.messages} busy={busy} onSend={send} />
+          <Chat
+            messages={ui.messages}
+            busy={busy}
+            onSend={(t) => send(t)}
+            talk={{
+              available: !!status?.voice.available,
+              reason: status?.voice.reason ?? null,
+              active: talking,
+              start: startTalk,
+              stop: stopTalk,
+            }}
+          />
         </main>
       )}
       {tab === "tools" && (

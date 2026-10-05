@@ -6,6 +6,8 @@
 //! (Hotkey/Button). Whisper läuft als kurzlebiger Prozess je Aufnahme und
 //! belegt danach keinen Speicher mehr.
 
+pub mod capture;
+
 use async_trait::async_trait;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -170,6 +172,35 @@ impl TextToSpeech for Piper {
     async fn stop(&self) {}
 }
 
+/// Wählt das erste vorhandene Whisper-Modell aus `preferred` (in Reihenfolge).
+pub fn pick_stt_model(dir: &Path, preferred: &[&str]) -> Option<PathBuf> {
+    preferred.iter().map(|m| dir.join(m)).find(|p| p.is_file())
+}
+
+/// Bereitet eine Antwort zum Vorlesen auf: Aktions-Hinweise werden nur
+/// kurz erwähnt, Markdown-Zeichen und URLs nicht vorgelesen.
+pub fn speakable(answer: &str) -> String {
+    let (main, notes) = match answer.find("\n\nHinweis zu Aktionen:") {
+        Some(i) => (&answer[..i], true),
+        None => (answer, false),
+    };
+    let mut out: String = main
+        .split_whitespace()
+        .map(|w| if w.starts_with("http://") || w.starts_with("https://") { "(Link)" } else { w })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !matches!(c, '*' | '#' | '`' | '_' | '|'))
+        .collect();
+    if out.chars().count() > 600 {
+        out = out.chars().take(600).collect::<String>() + " … Den Rest findest du im Fenster.";
+    }
+    if notes {
+        out.push_str(" Hinweis: Nicht alle Aktionen wurden ausgeführt. Details stehen im Fenster.");
+    }
+    out.trim().to_string()
+}
+
 /// Zustände der Sprachsteuerung.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum VoiceState {
@@ -249,6 +280,19 @@ mod tests {
         p.set_enabled(false);
         assert!(p.press().is_err(), "deaktiviert");
         assert!(!p.wake_word_enabled, "Wake Word standardmäßig aus");
+    }
+
+    #[test]
+    fn model_choice_and_speakable_text() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("ggml-small.bin"), "x").unwrap();
+        let m = pick_stt_model(d.path(), &["ggml-large-v3-turbo-q5_0.bin", "ggml-small.bin"]).unwrap();
+        assert!(m.ends_with("ggml-small.bin"), "fehlendes Turbo-Modell wird übersprungen");
+        assert!(pick_stt_model(d.path(), &["fehlt.bin"]).is_none());
+
+        let s = speakable("**Fertig.** Siehe https://example.org/x\n\nHinweis zu Aktionen:\n• fs_trash (nicht bestätigt)");
+        assert_eq!(s, "Fertig. Siehe (Link) Hinweis: Nicht alle Aktionen wurden ausgeführt. Details stehen im Fenster.");
+        assert!(speakable(&"Wort ".repeat(300)).ends_with("im Fenster."));
     }
 
     #[test]

@@ -282,7 +282,10 @@ async fn run(cmd: Cmd, dir: &Path) -> Result<(), String> {
         Cmd::Transcribe { wav } => {
             let cfg = load_config(dir)?;
             let hw = jarvis_resources::detect_hardware();
-            let model = expand(&cfg.voice.whisper_model_dir).join(model_profile(&cfg, &hw).stt_model);
+            let p = model_profile(&cfg, &hw);
+            let dir = expand(&cfg.voice.whisper_model_dir);
+            let model = jarvis_voice::pick_stt_model(&dir, &[&p.stt_model, &p.stt_fallback])
+                .ok_or_else(|| format!("kein Whisper-Modell in {} ({} oder {})", dir.display(), p.stt_model, p.stt_fallback))?;
             let t = WhisperCli::new(cfg.voice.whisper_binary, model).transcribe(Path::new(&wav)).await.map_err(|e| e.to_string())?;
             println!("{t}");
             Ok(())

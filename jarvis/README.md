@@ -3,8 +3,7 @@
 Lokale, datenschutzfreundliche Desktop-KI für macOS (Apple Silicon).
 Lokal-first, kostenlos und mit einem strikten Permission-System.
 
-> **Status:** Agent Core und Desktop-App laufen. Voice-Anbindung an den
-> Agenten ist der nächste Schritt.
+> **Status:** Agent Core, Desktop-App und Push-to-Talk (whisper.cpp → Agent → Sprachausgabe) laufen.
 
 ## Was schon da ist
 
@@ -20,7 +19,7 @@ Lokal-first, kostenlos und mit einem strikten Permission-System.
 | Spracherkennung (whisper.cpp), Sprachausgabe (macOS/Piper), Push-to-Talk | `jarvis-voice` |
 | **Agent Core**: understand → plan → tool selection → execute → observe → verify → finish | `jarvis-agent` |
 | CLI `jarvis` (chat, agent, doctor, tools, run, ask, login, audit, say, transcribe) | `jarvis-cli` |
-| **Desktop-App** (Tauri + React): Chat, Arc-Reactor-Status, Live-Aktivität, Bestätigungsdialog, Werkzeuge, Protokoll | `app/` |
+| **Desktop-App** (Tauri + React): Chat, Push-to-Talk, Arc-Reactor-Status, Live-Aktivität, Bestätigungsdialog, Werkzeuge, Protokoll | `app/` |
 
 ## Schnellstart (Mac)
 

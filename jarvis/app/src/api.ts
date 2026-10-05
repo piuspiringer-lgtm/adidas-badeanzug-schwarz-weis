@@ -11,6 +11,10 @@ export interface Backend {
   status(): Promise<Status>;
   tools(): Promise<ToolInfo[]>;
   audit(limit: number): Promise<AuditView>;
+  voiceStart(): Promise<void>;
+  voiceStop(): Promise<string>;
+  speak(text: string): Promise<void>;
+  stopSpeaking(): Promise<void>;
   onAgentEvent(cb: (e: AgentEvent) => void): Promise<() => void>;
   onConfirmRequest(cb: (r: ConfirmRequest) => void): Promise<() => void>;
   onConfirmClosed(cb: (id: string) => void): Promise<() => void>;
@@ -28,6 +32,10 @@ async function tauriBackend(): Promise<Backend> {
     status: () => invoke<Status>("system_status"),
     tools: () => invoke<ToolInfo[]>("list_tools"),
     audit: (limit) => invoke<AuditView>("audit_log", { limit }),
+    voiceStart: () => invoke("voice_start"),
+    voiceStop: () => invoke<string>("voice_stop"),
+    speak: (text) => invoke("speak", { text }),
+    stopSpeaking: () => invoke("stop_speaking"),
     onAgentEvent: (cb) => listen<AgentEvent>("agent-event", (e) => cb(e.payload)),
     onConfirmRequest: (cb) => listen<ConfirmRequest>("confirm-request", (e) => cb(e.payload)),
     onConfirmClosed: (cb) => listen<string>("confirm-closed", (e) => cb(e.payload)),

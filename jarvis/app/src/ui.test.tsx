@@ -50,6 +50,20 @@ describe("ConfirmDialog", () => {
   });
 });
 
+describe("Push-to-Talk", () => {
+  it("nimmt nur während des Haltens auf und schickt das Transkript an den Agenten", async () => {
+    render(<App />);
+    const mic = await screen.findByLabelText("Sprechtaste (gedrückt halten)");
+    await waitFor(() => expect((mic as HTMLButtonElement).disabled).toBe(false));
+    await act(async () => fireEvent.pointerDown(mic));
+    expect(mic.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("status").getAttribute("aria-label")).toContain("Hört zu");
+    await act(async () => fireEvent.pointerUp(mic));
+    await waitFor(() => expect(document.querySelector(".msg--user p")?.textContent).toBe("Finde meine PDFs im Ordner Dokumente"));
+    await waitFor(() => expect(screen.getByText(/3 PDFs gefunden/)).toBeTruthy(), { timeout: 3000 });
+  });
+});
+
 describe("App mit Mock-Backend", () => {
   it("führt eine destruktive Anfrage nur nach Bestätigung aus", async () => {
     render(<App />);

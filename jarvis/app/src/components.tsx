@@ -7,6 +7,8 @@ import type { AuditView, ConfirmRequest, Phase, Status, ToolInfo } from "./types
 
 const REACTOR_LABEL: Record<ReactorState, string> = {
   idle: "Bereit",
+  listening: "Hört zu",
+  transcribing: "Versteht",
   thinking: "Denkt nach",
   acting: "Arbeitet",
   waiting: "Wartet auf dich",
@@ -57,7 +59,15 @@ export function PhaseTrack({ current }: { current: Phase | null }) {
 
 // ---------- Chat ----------
 
-export function Chat({ messages, busy, onSend }: { messages: ChatMessage[]; busy: boolean; onSend: (t: string) => void }) {
+export interface Talk {
+  available: boolean;
+  reason: string | null;
+  active: boolean;
+  start: () => void;
+  stop: () => void;
+}
+
+export function Chat({ messages, busy, onSend, talk }: { messages: ChatMessage[]; busy: boolean; onSend: (t: string) => void; talk?: Talk }) {
   const [text, setText] = useState("");
   const end = useRef<HTMLDivElement>(null);
   useEffect(() => end.current?.scrollIntoView?.({ behavior: "smooth", block: "end" }), [messages.length]);
@@ -111,6 +121,27 @@ export function Chat({ messages, busy, onSend }: { messages: ChatMessage[]; busy
             }
           }}
         />
+        {talk && (
+          <button
+            type="button"
+            className={`mic ${talk.active ? "is-active" : ""}`}
+            disabled={busy || !talk.available}
+            title={talk.available ? "Gedrückt halten zum Sprechen (oder ⌥+Leertaste halten)" : talk.reason ?? "Sprache nicht verfügbar"}
+            aria-label="Sprechtaste (gedrückt halten)"
+            aria-pressed={talk.active}
+            onPointerDown={(e) => {
+              e.preventDefault();
+              talk.start();
+            }}
+            onPointerUp={talk.stop}
+            onPointerLeave={() => talk.active && talk.stop()}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="9" y="3" width="6" height="11" rx="3" />
+              <path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" />
+            </svg>
+          </button>
+        )}
         <button type="submit" disabled={busy || !text.trim()}>
           Senden
         </button>
