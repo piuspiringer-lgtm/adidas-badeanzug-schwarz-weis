@@ -24,6 +24,11 @@ pub struct LlmReply {
     pub hidden_reasoning_chars: usize,
     /// Antwort wurde durch die Längenbegrenzung abgeschnitten.
     pub truncated: bool,
+    /// Zeiten laut Ollama (ms) und GPU-Anteil des Modells – nur Diagnose.
+    pub load_ms: u64,
+    pub prompt_ms: u64,
+    pub gen_ms: u64,
+    pub gpu_share: Option<f64>,
 }
 
 #[async_trait]
@@ -113,6 +118,10 @@ impl LlmClient for ModelManager {
             output_tokens: r.output_tokens,
             hidden_reasoning_chars,
             truncated: r.truncated,
+            load_ms: r.load_ms,
+            prompt_ms: r.prompt_ms,
+            gen_ms: r.gen_ms,
+            gpu_share: r.gpu_share,
         })
     }
 

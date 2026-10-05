@@ -109,24 +109,73 @@ pub fn recommend_profile(hw: &Hardware) -> ModelProfile {
     }
 }
 
-pub fn decide_mode(s: &Snapshot) -> Mode {
+/// Entscheidung inkl. Begründung (für Anzeige und Diagnose).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ModeDecision {
+    pub mode: Mode,
+    /// Menschlich lesbare Gründe, z. B. "Akku 35 % ohne Netzteil".
+    pub reasons: Vec<String>,
+    /// Echter Speichermangel: nur dann (oder im Modus Kritisch) lohnt das
+    /// kleinere Modell. Akku/Wärme allein sind kein Grund, das Modell zu
+    /// wechseln: Ein Wechsel kostet Laden von der SSD und ein kleines Modell
+    /// erzeugt oft mehr Tokens (z. B. Denktext) – das spart keine Energie.
+    pub low_memory: bool,
+}
+
+impl ModeDecision {
+    /// Ob das kleine Fallback-Modell erzwungen werden soll.
+    pub fn force_small_model(&self) -> bool {
+        self.mode == Mode::Critical || self.low_memory
+    }
+}
+
+pub fn decide(s: &Snapshot) -> ModeDecision {
     let on_battery = s.battery.map(|b| !b.charging).unwrap_or(false);
     let pct = s.battery.map(|b| b.percent).unwrap_or(100);
     // macOS hält RAM bewusst voll (Cache, Kompression); "frei" ist dort kein
     // Engpass-Signal. Den echten Engpass meldet der Kernel als Speicherdruck.
-    let (ram_critical, ram_low) = match s.memory_pressure {
-        Some(p) => (p == MemoryPressure::Critical, p >= MemoryPressure::Warning),
-        None => (s.available_ram_gb < 1.0, s.available_ram_gb < 3.0),
+    let (ram_critical, ram_low, ram_why) = match s.memory_pressure {
+        Some(p) => (p == MemoryPressure::Critical, p >= MemoryPressure::Warning, format!("Speicherdruck {p:?}")),
+        None => (s.available_ram_gb < 1.0, s.available_ram_gb < 3.0, format!("nur {:.1} GB RAM frei (kein Speicherdruck-Wert)", s.available_ram_gb)),
     };
-    if s.thermal >= Thermal::Serious || (on_battery && pct < 15) || ram_critical {
-        Mode::Critical
-    } else if s.low_power_mode || (on_battery && pct < 40) || s.thermal == Thermal::Fair || ram_low {
-        Mode::Saver
-    } else if on_battery {
-        Mode::Balanced
-    } else {
-        Mode::Performance
+    let mut critical = vec![];
+    if s.thermal >= Thermal::Serious {
+        critical.push(format!("Thermik {:?}", s.thermal));
     }
+    if on_battery && pct < 15 {
+        critical.push(format!("Akku {pct} % ohne Netzteil"));
+    }
+    if ram_critical {
+        critical.push(ram_why.clone());
+    }
+    if !critical.is_empty() {
+        return ModeDecision { mode: Mode::Critical, reasons: critical, low_memory: ram_critical || ram_low };
+    }
+    let mut saver = vec![];
+    if s.low_power_mode {
+        saver.push("Stromsparmodus (Low Power) aktiv".to_string());
+    }
+    if on_battery && pct < 40 {
+        saver.push(format!("Akku {pct} % ohne Netzteil"));
+    }
+    if s.thermal == Thermal::Fair {
+        saver.push("Thermik Fair".to_string());
+    }
+    if ram_low {
+        saver.push(ram_why);
+    }
+    if !saver.is_empty() {
+        return ModeDecision { mode: Mode::Saver, reasons: saver, low_memory: ram_low };
+    }
+    if on_battery {
+        ModeDecision { mode: Mode::Balanced, reasons: vec![format!("Akkubetrieb ({pct} %)")], low_memory: false }
+    } else {
+        ModeDecision { mode: Mode::Performance, reasons: vec!["Netzteil, genug RAM".into()], low_memory: false }
+    }
+}
+
+pub fn decide_mode(s: &Snapshot) -> Mode {
+    decide(s).mode
 }
 
 /// Konkrete Einstellungen je Modus.
@@ -159,7 +208,8 @@ pub fn settings_for(mode: Mode) -> ModeSettings {
             background_embeddings: false,
         },
         Mode::Saver => ModeSettings {
-            use_fallback_model: true,
+            // Modellwechsel nur bei Speichermangel (siehe ModeDecision::force_small_model).
+            use_fallback_model: false,
             keep_alive_secs: 30,
             voice_enabled: true,
             use_stt_fallback: true,
@@ -315,7 +365,7 @@ mod tests {
         s.thermal = Thermal::Serious;
         assert_eq!(decide_mode(&s), Mode::Critical);
         assert!(!settings_for(Mode::Critical).voice_enabled);
-        assert!(settings_for(Mode::Saver).use_fallback_model);
+        assert!(settings_for(Mode::Critical).use_fallback_model);
     }
 
     /// Regression (Mac-Test): wenig "freier" RAM bei normalem Speicherdruck
@@ -334,6 +384,40 @@ mod tests {
         assert_eq!(parse_pressure_level("1\n"), Some(MemoryPressure::Normal));
         assert_eq!(parse_pressure_level("4"), Some(MemoryPressure::Critical));
         assert_eq!(parse_pressure_level("x"), None);
+    }
+
+    /// Regression (Mac-Test): Saver aus Akku-Gründen darf kein Modellwechsel
+    /// auf das kleine Modell erzwingen; nur Speichermangel oder Kritisch.
+    #[test]
+    fn decision_explains_and_only_low_memory_forces_small_model() {
+        let mut s = snap(Some((30, false)), 8.0);
+        s.memory_pressure = Some(MemoryPressure::Normal);
+        let d = decide(&s);
+        assert_eq!(d.mode, Mode::Saver);
+        assert_eq!(d.reasons, vec!["Akku 30 % ohne Netzteil".to_string()]);
+        assert!(!d.force_small_model(), "Akku allein → Hauptmodell behalten");
+
+        s.battery = Some(Battery { percent: 90, charging: true });
+        s.low_power_mode = true;
+        assert_eq!(decide(&s).reasons, vec!["Stromsparmodus (Low Power) aktiv".to_string()]);
+        assert!(!decide(&s).force_small_model());
+
+        s.low_power_mode = false;
+        s.memory_pressure = Some(MemoryPressure::Warning);
+        let d = decide(&s);
+        assert_eq!(d.mode, Mode::Saver);
+        assert!(d.force_small_model(), "echter Speicherdruck → kleines Modell");
+        assert_eq!(d.reasons, vec!["Speicherdruck Warning".to_string()]);
+
+        s.memory_pressure = None;
+        s.available_ram_gb = 2.2;
+        assert!(decide(&s).reasons[0].contains("kein Speicherdruck-Wert"));
+
+        s.available_ram_gb = 8.0;
+        s.thermal = Thermal::Serious;
+        let d = decide(&s);
+        assert_eq!(d.mode, Mode::Critical);
+        assert!(d.force_small_model());
     }
 
     #[test]

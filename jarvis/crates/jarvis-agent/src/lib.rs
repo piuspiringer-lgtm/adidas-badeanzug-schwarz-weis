@@ -59,6 +59,8 @@ pub struct Step {
     pub verification: Option<String>,
     /// Fehlerart (z. B. "tool_error"), falls nicht erfolgreich.
     pub error: Option<String>,
+    /// Gekürzte Werkzeug-Ausgabe (für Anzeige, falls das Modell nicht antwortet).
+    pub output: String,
     pub duration_ms: u128,
 }
 
@@ -67,13 +69,26 @@ pub struct Step {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     Phase { phase: Phase },
-    Understood { intent: String, complexity: Complexity, mode: Mode, model: String },
+    Understood { intent: String, complexity: Complexity, mode: Mode, mode_reasons: Vec<String>, model: String },
     Plan { text: String },
     ToolsSelected { tools: Vec<String> },
     ToolCall { tool: String, args: Value },
     ToolResult { tool: String, status: StepStatus, summary: String, duration_ms: u128 },
     /// Messung je Modellaufruf (Diagnose der Laufzeit).
-    LlmCall { purpose: String, model: String, duration_ms: u128, prompt_tokens: u64, output_tokens: u64, hidden_reasoning_chars: usize, truncated: bool },
+    LlmCall {
+        purpose: String,
+        model: String,
+        duration_ms: u128,
+        prompt_tokens: u64,
+        output_tokens: u64,
+        hidden_reasoning_chars: usize,
+        truncated: bool,
+        /// Laut Ollama: Laden, Prompt, Generierung (ms) und GPU-Anteil.
+        load_ms: u64,
+        prompt_ms: u64,
+        gen_ms: u64,
+        gpu_share: Option<f64>,
+    },
     Verified { tool: String, ok: bool, detail: String },
     Answer { text: String },
     Error { message: String },
@@ -99,6 +114,12 @@ pub struct Outcome {
 /// Liefert den aktuellen Ressourcenmodus (produktiv: Monitor + decide_mode).
 pub trait ResourceProbe: Send + Sync {
     fn mode(&self) -> Mode;
+
+    /// Modus mit Begründung. Standard: aus `mode()` abgeleitet.
+    fn decision(&self) -> jarvis_resources::ModeDecision {
+        let mode = self.mode();
+        jarvis_resources::ModeDecision { mode, reasons: vec![], low_memory: mode == Mode::Critical }
+    }
 }
 
 pub struct LiveResources(Mutex<jarvis_resources::Monitor>);
@@ -111,7 +132,11 @@ impl Default for LiveResources {
 
 impl ResourceProbe for LiveResources {
     fn mode(&self) -> Mode {
-        jarvis_resources::decide_mode(&self.0.lock().unwrap().snapshot())
+        self.decision().mode
+    }
+
+    fn decision(&self) -> jarvis_resources::ModeDecision {
+        jarvis_resources::decide(&self.0.lock().unwrap().snapshot())
     }
 }
 
@@ -260,6 +285,10 @@ impl Agent {
                 output_tokens: r.output_tokens,
                 hidden_reasoning_chars: r.hidden_reasoning_chars,
                 truncated: r.truncated,
+                load_ms: r.load_ms,
+                prompt_ms: r.prompt_ms,
+                gen_ms: r.gen_ms,
+                gpu_share: r.gpu_share,
             });
         }
         r
@@ -272,9 +301,12 @@ impl Agent {
 
         // ---------- understand ----------
         emit(AgentEvent::Phase { phase: Phase::Understand });
-        let mode = self.resources.mode();
+        let decision = self.resources.decision();
+        let mode = decision.mode;
         let power = settings_for(mode);
-        self.llm.apply_power(power.use_fallback_model, power.keep_alive_secs);
+        // Kleines Modell nur bei echtem Speichermangel oder im Modus Kritisch.
+        let force_small = decision.force_small_model() || power.use_fallback_model;
+        self.llm.apply_power(force_small, power.keep_alive_secs);
         let intent = select::intent_key(request);
         let budget = Budget::for_window(self.llm.context_window());
 
@@ -290,14 +322,14 @@ impl Agent {
             .collect();
         emit(AgentEvent::ToolsSelected { tools: offered.clone() });
 
-        let router = Router { strong_enabled: false, force_small: power.use_fallback_model };
+        let router = Router { strong_enabled: false, force_small };
         let mut complexity = router.classify(request, offered.len());
         if !offered.is_empty() && complexity == Complexity::Simple {
             complexity = Complexity::Standard;
         }
         let tier = router.tier(complexity);
         let model = self.llm.model_name(tier);
-        emit(AgentEvent::Understood { intent: intent.clone(), complexity, mode, model: model.clone() });
+        emit(AgentEvent::Understood { intent: intent.clone(), complexity, mode, mode_reasons: decision.reasons.clone(), model: model.clone() });
 
         // Lebensdauer des Modell-Dienstes an den Lauf koppeln (Lifecycle).
         let services = self.gateway.services();
@@ -389,6 +421,16 @@ impl Agent {
                     messages.push(Message::new("assistant", reply.content.clone()));
                     messages.push(Message::new("user", format!("Systemprüfung: Folgende Aktionen haben ihr Ziel nicht erreicht: {}. Korrigiere das oder erkläre es.", detail.join("; "))));
                     continue;
+                }
+                // Abgeschnitten ohne Tool-Aufruf: Der Text ist unvollständig und
+                // kann ungetaggten Denktext enthalten → nie anzeigen. Stattdessen
+                // ehrlich melden und die echten Werkzeug-Ergebnisse nennen.
+                if reply.truncated {
+                    let msg = "Das Sprachmodell hat innerhalb des Längenlimits keine fertige Antwort geliefert.".to_string();
+                    emit(AgentEvent::Error { message: msg.clone() });
+                    let results: Vec<String> = steps.iter().filter(|s| s.status == StepStatus::Ok).map(|s| format!("• {}: {}", s.tool, s.output)).collect();
+                    answer = Some(if results.is_empty() { msg } else { format!("{msg}\n\nErgebnis der Werkzeuge:\n{}", results.join("\n")) });
+                    break;
                 }
                 if reply.content.trim().is_empty() && !verify_retry_used {
                     verify_retry_used = true;
@@ -491,8 +533,10 @@ impl Agent {
         // ---------- observe ----------
         emit(AgentEvent::Phase { phase: Phase::Observe });
         let mut error = None;
+        let mut output = String::new();
         let (status, summary, observation, verification) = match result {
             Ok(out) => {
+                output = compact_tool_output(&out.text, 250);
                 let verification = verify::verify_effect(&call.name, &out.data);
                 let (status, vtext) = match &verification {
                     Some(Ok(v)) => (StepStatus::Ok, Some(v.clone())),
@@ -530,7 +574,7 @@ impl Agent {
         };
         let _ = self.memory.record_tool_result(&call.name, intent, status == StepStatus::Ok, ms as f64);
         emit(AgentEvent::ToolResult { tool: call.name.clone(), status, summary: summary.clone(), duration_ms: ms });
-        steps.push(Step { tool: call.name.clone(), args: call.arguments.clone(), status, summary, verification, error, duration_ms: ms });
+        steps.push(Step { tool: call.name.clone(), args: call.arguments.clone(), status, summary, verification, error, output, duration_ms: ms });
         observation
     }
 

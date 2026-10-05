@@ -72,8 +72,14 @@ Idle-Timeout. Bei Speicherdruck entlädt `unload_all_unused()` sofort.
 |---|---|---|
 | Performance | Netzteil, genug RAM | Hauptmodell, keep_alive 300 s, Whisper turbo |
 | Balanced | Akku | Hauptmodell, keep_alive 120 s, kein Wake Word |
-| Saver | Akku < 40 %, Low Power, < 3 GB frei, Thermik „fair“ | Fallback-Modell, keep_alive 30 s, Whisper small |
-| Critical | Akku < 15 %, < 1 GB frei, Thermik „serious“ | nur Text, Modell sofort entladen |
+| Saver | Akku < 40 %, Low Power, Thermik „fair“, Speicherdruck „Warning“ | keep_alive 30 s, Whisper small; **Fallback-Modell nur bei Speicherdruck** |
+| Critical | Akku < 15 %, Speicherdruck „Critical“, Thermik „serious“ | nur Text, Fallback-Modell, Modell sofort entladen |
+
+Speicher: Unter macOS entscheidet `kern.memorystatus_vm_pressure_level`; nur wenn
+der Wert nicht lesbar ist, gilt „frei < 3 GB / < 1 GB“. Akku oder Wärme allein
+wechseln das Modell nicht (ein Wechsel lädt GB von der SSD, und ein kleines
+Denk-Modell erzeugt oft ein Vielfaches an Tokens). Jede Entscheidung trägt ihre
+Gründe; `jarvis agent -v` und `jarvis doctor` zeigen sie an.
 
 ## Modellwahl nach RAM
 

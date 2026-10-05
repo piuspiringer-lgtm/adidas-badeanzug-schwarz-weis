@@ -6,12 +6,12 @@ export type Mode = "Performance" | "Balanced" | "Saver" | "Critical";
 
 export type AgentEvent =
   | { type: "phase"; phase: Phase }
-  | { type: "understood"; intent: string; complexity: string; mode: Mode; model: string }
+  | { type: "understood"; intent: string; complexity: string; mode: Mode; mode_reasons?: string[]; model: string }
   | { type: "plan"; text: string }
   | { type: "tools_selected"; tools: string[] }
   | { type: "tool_call"; tool: string; args: unknown }
   | { type: "tool_result"; tool: string; status: StepStatus; summary: string; duration_ms?: number }
-  | { type: "llm_call"; purpose: string; model: string; duration_ms: number; prompt_tokens: number; output_tokens: number; hidden_reasoning_chars: number; truncated: boolean }
+  | { type: "llm_call"; purpose: string; model: string; duration_ms: number; prompt_tokens: number; output_tokens: number; hidden_reasoning_chars: number; truncated: boolean; load_ms?: number; prompt_ms?: number; gen_ms?: number; gpu_share?: number | null }
   | { type: "verified"; tool: string; ok: boolean; detail: string }
   | { type: "answer"; text: string }
   | { type: "error"; message: string };

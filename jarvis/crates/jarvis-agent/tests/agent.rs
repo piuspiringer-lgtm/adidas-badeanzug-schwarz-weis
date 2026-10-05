@@ -126,6 +126,21 @@ struct Env {
 }
 
 fn build(llm: Arc<ScriptedLlm>, confirm: bool, mode: Mode) -> (Agent, Env) {
+    build_probe(llm, confirm, Arc::new(FixedMode(mode)))
+}
+
+/// Ressourcenmodus mit eigener Begründung (z. B. Speichermangel).
+struct Probe(jarvis_resources::ModeDecision);
+impl ResourceProbe for Probe {
+    fn mode(&self) -> Mode {
+        self.0.mode
+    }
+    fn decision(&self) -> jarvis_resources::ModeDecision {
+        self.0.clone()
+    }
+}
+
+fn build_probe(llm: Arc<ScriptedLlm>, confirm: bool, probe: Arc<dyn ResourceProbe>) -> (Agent, Env) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap().join("Dokumente");
     std::fs::create_dir_all(root.join("Schule")).unwrap();
@@ -147,7 +162,7 @@ fn build(llm: Arc<ScriptedLlm>, confirm: bool, mode: Mode) -> (Agent, Env) {
     let confirmer = Arc::new(Confirm(confirm, Mutex::default()));
     let gateway = Arc::new(ToolGateway::new(reg, PolicyEngine::new(vec![]), services.clone(), confirmer.clone(), Arc::new(audit.clone())));
     let cfg = AgentConfig { fs_roots: vec![root.clone()], ..Default::default() };
-    let agent = Agent::new(gateway, llm, memory.clone(), Arc::new(FixedMode(mode)), cfg);
+    let agent = Agent::new(gateway, llm, memory.clone(), probe, cfg);
     (agent, Env { _dir: dir, root, memory, audit, confirmer, services })
 }
 
@@ -318,7 +333,9 @@ async fn failed_verification_is_reported_back_and_surfaced() {
 
 #[tokio::test]
 async fn resource_mode_forces_small_model() {
-    for (mode, small) in [(Mode::Performance, false), (Mode::Saver, true), (Mode::Critical, true)] {
+    // Saver wegen Akku/Wärme behält das Hauptmodell (Regression Mac-Test);
+    // nur Kritisch oder echter Speichermangel erzwingen das kleine Modell.
+    for (mode, small) in [(Mode::Performance, false), (Mode::Saver, false), (Mode::Critical, true)] {
         let llm = ScriptedLlm::new(vec![say("ok")]);
         let (agent, env) = build(llm.clone(), true, mode);
         let (sink, events) = collector();
@@ -333,6 +350,39 @@ async fn resource_mode_forces_small_model() {
         let expected = if mode == Mode::Critical { ServiceState::Off } else { ServiceState::Idle };
         assert_eq!(env.services.state("ollama"), Some(expected), "{mode:?}");
     }
+}
+
+#[tokio::test]
+async fn low_memory_saver_forces_small_model_with_reason() {
+    let llm = ScriptedLlm::new(vec![say("ok")]);
+    let d = jarvis_resources::ModeDecision { mode: Mode::Saver, reasons: vec!["Speicherdruck Warning".into()], low_memory: true };
+    let (agent, _env) = build_probe(llm.clone(), true, Arc::new(Probe(d)));
+    let (sink, events) = collector();
+    agent.run("Zeig mir den Ordner Schule", sink).await;
+    assert!(llm.power.lock().unwrap().unwrap().0, "Speichermangel → kleines Modell");
+    let reasons = events.lock().unwrap().iter().find_map(|e| match e {
+        AgentEvent::Understood { mode_reasons, .. } => Some(mode_reasons.clone()),
+        _ => None,
+    });
+    assert_eq!(reasons.unwrap(), vec!["Speicherdruck Warning".to_string()]);
+}
+
+/// Regression (Mac-Test): Aufruf 2 lief ins Längenlimit. Abgeschnittener Text
+/// (evtl. ungetaggter Denktext) darf nie als Antwort erscheinen.
+#[tokio::test]
+async fn truncated_answer_is_never_shown_tool_result_is() {
+    let llm = ScriptedLlm::new(vec![]);
+    let (agent, env) = build(llm.clone(), true, Mode::Performance);
+    llm.replies.lock().unwrap().extend([
+        call("fs_search", json!({"root": env.root, "pattern": "*.txt"})),
+        LlmReply { content: "Okay, so the user wants the files. Let me think about how to phrase".into(), truncated: true, ..Default::default() },
+    ]);
+    let (sink, _) = collector();
+    let out = agent.run("Finde meine Textdateien im Ordner Dokumente", sink).await;
+    assert!(!out.answer.contains("Okay, so the user"), "{}", out.answer);
+    assert!(out.answer.contains("keine fertige Antwort"), "{}", out.answer);
+    assert!(out.answer.contains("fs_search") && out.answer.contains("alt.txt"), "{}", out.answer);
+    assert_eq!(llm.seen.lock().unwrap().len(), 2, "kein weiterer teurer Versuch");
 }
 
 #[tokio::test]

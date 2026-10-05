@@ -49,6 +49,19 @@ pub struct ChatResult {
     /// Antwort hat die Längenbegrenzung erreicht (abgeschnitten).
     pub truncated: bool,
     pub used_fallback: bool,
+    /// Zeiten laut Ollama (ms): Modell laden, Prompt verarbeiten, Tokens erzeugen.
+    pub load_ms: u64,
+    pub prompt_ms: u64,
+    pub gen_ms: u64,
+    /// Anteil des Modells im GPU-Speicher (1.0 = 100 % GPU), laut `/api/ps`.
+    pub gpu_share: Option<f64>,
+}
+
+impl ChatResult {
+    /// Erzeugte Tokens pro Sekunde (reine Generierung).
+    pub fn gen_tokens_per_s(&self) -> Option<f64> {
+        (self.gen_ms > 0).then(|| self.output_tokens as f64 * 1000.0 / self.gen_ms as f64)
+    }
 }
 
 /// Obergrenze für erzeugte Tokens pro Modellaufruf. Normale Antworten und
@@ -153,7 +166,19 @@ impl OllamaClient {
             output_tokens: v["eval_count"].as_u64().unwrap_or(0),
             truncated: v["done_reason"].as_str() == Some("length"),
             used_fallback: false,
+            load_ms: v["load_duration"].as_u64().unwrap_or(0) / 1_000_000,
+            prompt_ms: v["prompt_eval_duration"].as_u64().unwrap_or(0) / 1_000_000,
+            gen_ms: v["eval_duration"].as_u64().unwrap_or(0) / 1_000_000,
+            gpu_share: None,
         })
+    }
+
+    /// GPU-Anteil eines geladenen Modells (`size_vram / size`); `None`, wenn
+    /// das Modell nicht geladen ist oder Ollama keine Werte liefert.
+    pub async fn gpu_share(&self, model: &str) -> Option<f64> {
+        let loaded = self.loaded().await.ok()?;
+        let m = loaded.iter().find(|m| m.name == model || m.name.strip_suffix(":latest") == Some(model))?;
+        (m.size > 0).then(|| m.size_vram as f64 / m.size as f64)
     }
 
     pub async fn embed(&self, model: &str, input: &[String], keep_alive: u64) -> Result<Vec<Vec<f32>>, ModelError> {
@@ -207,6 +232,12 @@ impl ModelManager {
         &self.client
     }
 
+    /// Ob JARVIS den Ollama-Server selbst gestartet hat (dann gelten dessen
+    /// Umgebungsvariablen) oder ein externer Server (z. B. Ollama.app) läuft.
+    pub fn started_server(&self) -> bool {
+        self.spawned.lock().unwrap().is_some()
+    }
+
     pub fn profile(&self) -> ModelProfile {
         self.settings.lock().unwrap().profile.clone()
     }
@@ -258,7 +289,10 @@ impl ModelManager {
         let think = tier == ModelTier::Strong;
         self.switch_to(&model).await;
         match self.client.chat(&model, messages, tools, ctx, keep, think).await {
-            Ok(r) => Ok(r),
+            Ok(mut r) => {
+                r.gpu_share = self.client.gpu_share(&model).await;
+                Ok(r)
+            }
             Err(e @ ModelError::Unreachable(_)) => Err(e),
             Err(_) if model != fallback => {
                 self.switch_to(&fallback).await;
@@ -432,6 +466,22 @@ mod tests {
         let r = m.chat(ModelTier::LocalMain, &[Message::new("user", "Hi")], &[]).await.unwrap();
         assert!(r.used_fallback);
         assert_eq!(r.model, "qwen3:4b");
+    }
+
+    #[tokio::test]
+    async fn timings_and_gpu_share_are_reported() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/api/chat")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "qwen3:8b", "message": {"role": "assistant", "content": "ok"}, "done": true,
+            "eval_count": 100, "eval_duration": 2_000_000_000u64, "prompt_eval_duration": 500_000_000u64, "load_duration": 3_000_000_000u64
+        }))).mount(&s).await;
+        Mock::given(method("GET")).and(path("/api/ps")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "models": [{"name": "qwen3:8b", "size": 6_000_000_000u64, "size_vram": 3_000_000_000u64}]
+        }))).mount(&s).await;
+        let r = manager(&s.uri()).chat(ModelTier::LocalMain, &[Message::new("user", "Hi")], &[]).await.unwrap();
+        assert_eq!((r.load_ms, r.prompt_ms, r.gen_ms), (3000, 500, 2000));
+        assert_eq!(r.gen_tokens_per_s(), Some(50.0));
+        assert_eq!(r.gpu_share, Some(0.5), "halb CPU / halb GPU erkennbar");
     }
 
     /// Regression (Mac-Test): kein Denkmodus, begrenzte Länge.

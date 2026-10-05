@@ -78,14 +78,27 @@ impl Confirmer for TerminalConfirmer {
 fn event_printer(verbose: bool) -> jarvis_agent::EventSink {
     use jarvis_agent::{AgentEvent, StepStatus};
     Arc::new(move |e| match e {
-        AgentEvent::Understood { intent, complexity, mode, model } if verbose => {
-            eprintln!("  · verstanden: „{intent}“ · {complexity:?} · Modus {mode:?} · {model}")
+        AgentEvent::Understood { intent, complexity, mode, mode_reasons, model } if verbose => {
+            let why = if mode_reasons.is_empty() { String::new() } else { format!(" ({})", mode_reasons.join(", ")) };
+            eprintln!("  · verstanden: „{intent}“ · {complexity:?} · Modus {mode:?}{why} · {model}")
         }
         AgentEvent::Plan { text } => eprintln!("  · Plan:\n{}", text.lines().map(|l| format!("      {l}")).collect::<Vec<_>>().join("\n")),
         AgentEvent::ToolsSelected { tools } if verbose => eprintln!("  · Tools: {}", tools.join(", ")),
         AgentEvent::ToolCall { tool, args } => eprintln!("  → {tool} {args}"),
-        AgentEvent::LlmCall { purpose, model, duration_ms, prompt_tokens, output_tokens, hidden_reasoning_chars, truncated } if verbose => {
+        AgentEvent::LlmCall { purpose, model, duration_ms, prompt_tokens, output_tokens, hidden_reasoning_chars, truncated, load_ms, prompt_ms, gen_ms, gpu_share } if verbose => {
             let mut extra = String::new();
+            if gen_ms > 0 {
+                extra.push_str(&format!(
+                    "\n      Ollama: Laden {:.1} s · Prompt {:.1} s · Erzeugen {:.1} s = {:.1} Tokens/s",
+                    load_ms as f64 / 1000.0,
+                    prompt_ms as f64 / 1000.0,
+                    gen_ms as f64 / 1000.0,
+                    output_tokens as f64 * 1000.0 / gen_ms as f64
+                ));
+            }
+            if let Some(g) = gpu_share {
+                extra.push_str(&format!(" · GPU-Anteil {:.0} %", g * 100.0));
+            }
             if hidden_reasoning_chars > 0 {
                 extra.push_str(&format!(" · Denktext verworfen: {hidden_reasoning_chars} Zeichen"));
             }
@@ -327,7 +340,24 @@ async fn doctor(dir: &Path, online: bool) -> Result<(), String> {
     let mut mon = Monitor::new();
     let snap = mon.snapshot();
     let mode = decide_mode(&snap);
-    ok("Ressourcen", format!("{:.1} GB frei · Akku {:?} · Thermik {:?} → Modus {mode:?}", snap.available_ram_gb, snap.battery, snap.thermal));
+    let decision = jarvis_resources::decide(&snap);
+    ok(
+        "Ressourcen",
+        format!(
+            "RAM frei (geschätzt) {:.1} GB · Speicherdruck {} · Akku {} · Low Power {} · Thermik {:?}",
+            snap.available_ram_gb,
+            snap.memory_pressure.map(|p| format!("{p:?}")).unwrap_or_else(|| "nicht lesbar".into()),
+            snap.battery.map(|b| format!("{} % {}", b.percent, if b.charging { "(Netzteil)" } else { "(Akku)" })).unwrap_or_else(|| "–".into()),
+            if snap.low_power_mode { "an" } else { "aus" },
+            snap.thermal
+        ),
+    );
+    let modeline = format!("{mode:?} – {} · kleines Modell erzwungen: {}", decision.reasons.join(", "), if decision.force_small_model() { "ja" } else { "nein" });
+    if mode == jarvis_resources::Mode::Performance || mode == jarvis_resources::Mode::Balanced {
+        ok("Modus", modeline);
+    } else {
+        warn("Modus", modeline);
+    }
     if let Ok(out) = std::process::Command::new("df").args(["-g", "/"]).output() {
         let free = String::from_utf8_lossy(&out.stdout).lines().nth(1).and_then(|l| l.split_whitespace().nth(3).map(str::to_string)).unwrap_or_default();
         match free.parse::<u64>() {
@@ -351,13 +381,40 @@ async fn doctor(dir: &Path, online: bool) -> Result<(), String> {
                 Ok(m) => warn("Modelle", format!("fehlen: {} → scripts/setup-mac.sh", m.join(", "))),
                 Err(e) => fail("Modelle", e),
             }
+            if app.models.started_server() {
+                ok("Ollama-Server", "von JARVIS gestartet (mit FLASH_ATTENTION, KV-Cache q8_0, 1 Modell)");
+            } else {
+                warn("Ollama-Server", "läuft extern (z. B. Ollama.app) – JARVIS-Einstellungen wie FLASH_ATTENTION gelten dort nicht");
+            }
+            // Jedes Modell einzeln messen: Geschwindigkeit, GPU-Anteil, Denkverhalten.
             let missing = app.models.missing_models().await.unwrap_or_default();
-            if !missing.contains(&profile.fallback) {
-                let t = std::time::Instant::now();
-                match app.models.chat(jarvis_context::ModelTier::LocalSmall, &[Message::new("user", "Antworte nur mit dem Wort OK.")], &[]).await {
-                    Ok(r) => ok("Testanfrage", format!("{} antwortet '{}' in {:.1}s", r.model, r.content.trim().chars().take(40).collect::<String>(), t.elapsed().as_secs_f32())),
-                    Err(e) => fail("Testanfrage", e),
+            let c = app.models.client();
+            for (role, m) in [("Hauptmodell", &profile.main), ("Fallback", &profile.fallback)] {
+                if missing.contains(m) {
+                    continue;
                 }
+                let msgs = [Message::new("system", "Du bist ein Test."), Message::new("user", "Antworte nur mit dem Wort OK.")];
+                match c.chat(m, &msgs, &[], 2048, 30, false).await {
+                    Ok(r) => {
+                        let tps = r.gen_tokens_per_s().map(|v| format!("{v:.1} Tokens/s")).unwrap_or_else(|| "? Tokens/s".into());
+                        let gpu = c.gpu_share(m).await.map(|g| format!("{:.0} % GPU", g * 100.0)).unwrap_or_else(|| "GPU-Anteil ?".into());
+                        let thinks = r.content.contains("</think>") || r.output_tokens > 40;
+                        let line = format!(
+                            "{m}: {} Tokens in {:.1} s ({tps}) · Laden {:.1} s · {gpu}{}",
+                            r.output_tokens,
+                            r.gen_ms as f64 / 1000.0,
+                            r.load_ms as f64 / 1000.0,
+                            if thinks { " · DENKT trotz think:false (reine Thinking-Variante?)" } else { "" }
+                        );
+                        if thinks || c.gpu_share(m).await.is_some_and(|g| g < 0.99) {
+                            warn(role, line)
+                        } else {
+                            ok(role, line)
+                        }
+                    }
+                    Err(e) => fail(role, e),
+                }
+                let _ = c.unload(m).await;
             }
             let _ = app.models.unload().await;
             ok("Entladen", "Modell und ggf. gestarteter Server wieder beendet");
