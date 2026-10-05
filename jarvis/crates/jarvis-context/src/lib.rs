@@ -128,11 +128,25 @@ pub async fn summarize_if_needed(text: &str, budget: usize, s: &dyn Summarizer) 
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// Tool-Aufrufe einer Assistenten-Nachricht (Ollama-Format).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<serde_json::Value>,
+    /// Name des Tools bei `role = "tool"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 impl Message {
     pub fn new(role: &str, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into() }
+        Self { role: role.into(), content: content.into(), tool_calls: vec![], tool_name: None }
+    }
+
+    pub fn assistant_tool_calls(content: impl Into<String>, calls: Vec<serde_json::Value>) -> Self {
+        Self { role: "assistant".into(), content: content.into(), tool_calls: calls, tool_name: None }
+    }
+
+    pub fn tool(name: &str, content: impl Into<String>) -> Self {
+        Self { role: "tool".into(), content: content.into(), tool_calls: vec![], tool_name: Some(name.into()) }
     }
 }
 
@@ -172,7 +186,11 @@ pub async fn compress_history(
         return messages.to_vec();
     }
     let (system, rest): (Vec<_>, Vec<_>) = messages.iter().cloned().partition(|m| m.role == "system");
-    let split = rest.len().saturating_sub(keep_recent);
+    let mut split = rest.len().saturating_sub(keep_recent);
+    // Nie zwischen Tool-Aufruf und Tool-Ergebnis schneiden.
+    while split > 0 && rest[split].role == "tool" {
+        split -= 1;
+    }
     let (old, recent) = rest.split_at(split);
     let mut recent = recent.to_vec();
     let recent_tokens: usize = recent.iter().map(|m| estimate_tokens(&m.content)).sum();
@@ -283,6 +301,21 @@ mod tests {
 
         let out2 = compress_history(&msgs, 800, 4, None).await;
         assert!(out2[1].content.contains("Frage 0"));
+    }
+
+    #[tokio::test]
+    async fn history_compression_keeps_tool_results_with_their_call() {
+        let mut msgs = vec![Message::new("system", "S")];
+        for i in 0..20 {
+            msgs.push(Message::new("user", format!("Frage {i} {}", "x ".repeat(80))));
+        }
+        msgs.push(Message::assistant_tool_calls("", vec![serde_json::json!({"function": {"name": "fs_list"}})]));
+        msgs.push(Message::tool("fs_list", "a.txt"));
+        msgs.push(Message::tool("fs_list", "b.txt"));
+        let out = compress_history(&msgs, 300, 2, None).await;
+        let first_recent = out.iter().position(|m| m.role != "system").unwrap();
+        assert_eq!(out[first_recent].role, "assistant", "Tool-Ergebnisse ohne Aufruf: {out:?}");
+        assert_eq!(out.last().unwrap().tool_name.as_deref(), Some("fs_list"));
     }
 
     #[test]

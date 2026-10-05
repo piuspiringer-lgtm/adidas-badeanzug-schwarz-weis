@@ -233,7 +233,15 @@ impl ModelManager {
             let s = self.settings.lock().unwrap();
             (s.profile.context_window, s.keep_alive_secs, s.profile.fallback.clone())
         };
-        let model = self.model_for(tier);
+        let mut model = self.model_for(tier);
+        // Ist das Hauptmodell bereits geladen, beantwortet es auch einfache
+        // Fragen: ein Modellwechsel (entladen + ~2,5 GB von der SSD laden)
+        // kostet mehr Zeit und Akku, als das kleinere Modell spart.
+        let force = *self.force_fallback.lock().unwrap();
+        let current = self.current.lock().unwrap().clone();
+        if tier == ModelTier::LocalSmall && !force && current.as_deref() == Some(self.profile().main.as_str()) {
+            model = self.profile().main;
+        }
         let think = tier == ModelTier::Strong;
         self.switch_to(&model).await;
         match self.client.chat(&model, messages, tools, ctx, keep, think).await {
@@ -411,6 +419,22 @@ mod tests {
         let r = m.chat(ModelTier::LocalMain, &[Message::new("user", "Hi")], &[]).await.unwrap();
         assert!(r.used_fallback);
         assert_eq!(r.model, "qwen3:4b");
+    }
+
+    #[tokio::test]
+    async fn loaded_main_model_is_reused_for_simple_tasks() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/api/chat")).and(body_partial_json(json!({"model": "qwen3:8b"}))).respond_with(chat_ok("qwen3:8b", "ok")).expect(2).mount(&s).await;
+        Mock::given(method("POST")).and(path("/api/chat")).and(body_partial_json(json!({"model": "qwen3:4b"}))).respond_with(chat_ok("qwen3:4b", "ok")).expect(1).mount(&s).await;
+        Mock::given(method("POST")).and(path("/api/generate")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"done": true}))).mount(&s).await;
+        let m = manager(&s.uri());
+        let hi = [Message::new("user", "Hallo")];
+        m.chat(ModelTier::LocalMain, &hi, &[]).await.unwrap();
+        // Hauptmodell geladen → kein Wechsel für Smalltalk.
+        assert_eq!(m.chat(ModelTier::LocalSmall, &hi, &[]).await.unwrap().model, "qwen3:8b");
+        // Ressourcenmodus erzwingt das kleine Modell → Wechsel.
+        m.set_force_fallback(true, 30);
+        assert_eq!(m.chat(ModelTier::LocalSmall, &hi, &[]).await.unwrap().model, "qwen3:4b");
     }
 
     #[tokio::test]

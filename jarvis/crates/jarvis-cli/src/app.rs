@@ -182,7 +182,9 @@ pub struct App {
     pub audit: SqliteAudit,
     pub models: Arc<ModelManager>,
     pub research: Arc<web::Research>,
-    pub gateway: ToolGateway,
+    pub gateway: Arc<ToolGateway>,
+    /// Freigegebene (existierende) Ordner der Dateisystem-Sandbox.
+    pub fs_roots: Vec<PathBuf>,
     /// Integrationen, die mangels Konfiguration nicht aktiv sind (mit Grund).
     pub inactive: Vec<(String, String)>,
 }
@@ -229,12 +231,14 @@ pub fn build(dir: &Path, confirmer: Arc<dyn Confirmer>) -> Result<App, String> {
     let research = Arc::new(web::Research::new(client.clone(), search_providers(&config, &client), memory.clone()));
 
     let protected = vec![dir.to_path_buf()];
-    let sandbox = Arc::new(fs::FsSandbox::new(config.filesystem.roots.iter().map(|r| expand(r)).filter(|p| p.exists()).collect(), protected.clone()));
+    let fs_roots: Vec<PathBuf> = config.filesystem.roots.iter().map(|r| expand(r)).filter(|p| p.exists()).collect();
+    let sandbox = Arc::new(fs::FsSandbox::new(fs_roots.clone(), protected.clone()));
 
     let mut tools: Vec<Arc<dyn Tool>> = vec![];
     let mut inactive = vec![];
     tools.extend(fs::tools(sandbox, Arc::new(fs::SystemOpener)));
     tools.extend(web::tools(research.clone()));
+    tools.extend(jarvis_integrations::memory::tools(memory.clone()));
 
     let ms = microsoft_tokens(&config);
     match (config.mail.provider.as_str(), &ms) {
@@ -271,8 +275,22 @@ pub fn build(dir: &Path, confirmer: Arc<dyn Confirmer>) -> Result<App, String> {
     for t in tools {
         registry.register(t).map_err(|e| e.to_string())?;
     }
-    let gateway = ToolGateway::new(registry, PolicyEngine::new(protected), services, confirmer, Arc::new(audit.clone()));
-    Ok(App { config, hardware, memory, audit, models, research, gateway, inactive })
+    let gateway = Arc::new(ToolGateway::new(registry, PolicyEngine::new(protected), services, confirmer, Arc::new(audit.clone())));
+    Ok(App { config, hardware, memory, audit, models, research, gateway, fs_roots, inactive })
+}
+
+impl App {
+    /// Agent Core über der gesamten Infrastruktur. Startet zusätzlich den
+    /// Hintergrund-Reaper, der ungenutzte Dienste nach ihrem Idle-Timeout entlädt.
+    pub fn agent(&self) -> jarvis_agent::Agent {
+        self.gateway.services().spawn_reaper(std::time::Duration::from_secs(15));
+        let cfg = jarvis_agent::AgentConfig {
+            fs_roots: self.fs_roots.clone(),
+            user_name: self.memory.preference("name").ok().flatten(),
+            ..Default::default()
+        };
+        jarvis_agent::Agent::new(self.gateway.clone(), self.models.clone(), self.memory.clone(), Arc::new(jarvis_agent::LiveResources::default()), cfg)
+    }
 }
 
 pub const EXAMPLE_CONFIG: &str = r#"# JARVIS-Konfiguration (keine Passwörter oder Tokens hier eintragen!)

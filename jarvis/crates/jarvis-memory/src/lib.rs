@@ -128,6 +128,14 @@ impl Memory {
             .optional()?)
     }
 
+    /// Alle Präferenzen (neueste zuerst).
+    pub fn preferences(&self, limit: usize) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare("SELECT key, value FROM preferences ORDER BY updated_at DESC, key LIMIT ?1")?;
+        let rows = st.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     // ---------- Fakten ----------
     pub fn remember_fact(&self, topic: &str, fact: &str, source: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(

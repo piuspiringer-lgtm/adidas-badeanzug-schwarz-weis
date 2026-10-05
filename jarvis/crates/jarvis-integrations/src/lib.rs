@@ -5,6 +5,7 @@
 pub mod fs;
 pub mod http;
 pub mod mail;
+pub mod memory;
 pub mod oauth;
 pub mod teams;
 pub mod web;

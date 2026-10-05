@@ -32,7 +32,19 @@ enum Cmd {
     Tools,
     /// Führt ein Tool über den Gateway aus, z. B. `jarvis run fs_list '{"path":"~/Documents"}'`.
     Run { tool: String, #[arg(default_value = "{}")] args: String },
-    /// Fragt das lokale Modell (mit Routing einfach/normal/komplex).
+    /// Führt einen Auftrag mit dem Agenten aus (Tools, Bestätigungen, Memory).
+    Agent {
+        task: Vec<String>,
+        /// Alle Agent-Schritte ausführlich anzeigen.
+        #[arg(long, short)]
+        verbose: bool,
+    },
+    /// Interaktiver Dialog mit JARVIS (Agent mit Gesprächsverlauf).
+    Chat {
+        #[arg(long, short)]
+        verbose: bool,
+    },
+    /// Fragt das lokale Modell direkt, ohne Tools (Routing einfach/normal/komplex).
     Ask { prompt: Vec<String> },
     /// Anmeldung bei Microsoft 365 (nur Lese-Berechtigungen).
     Login { provider: String },
@@ -60,6 +72,32 @@ impl Confirmer for TerminalConfirmer {
         let mut s = String::new();
         std::io::stdin().read_line(&mut s).is_ok() && matches!(s.trim().to_lowercase().as_str(), "j" | "ja" | "y" | "yes")
     }
+}
+
+/// Zeigt die Agent-Ereignisse im Terminal (kompakt oder ausführlich).
+fn event_printer(verbose: bool) -> jarvis_agent::EventSink {
+    use jarvis_agent::{AgentEvent, StepStatus};
+    Arc::new(move |e| match e {
+        AgentEvent::Understood { intent, complexity, mode, model } if verbose => {
+            eprintln!("  · verstanden: „{intent}“ · {complexity:?} · Modus {mode:?} · {model}")
+        }
+        AgentEvent::Plan { text } => eprintln!("  · Plan:\n{}", text.lines().map(|l| format!("      {l}")).collect::<Vec<_>>().join("\n")),
+        AgentEvent::ToolsSelected { tools } if verbose => eprintln!("  · Tools: {}", tools.join(", ")),
+        AgentEvent::ToolCall { tool, args } => eprintln!("  → {tool} {args}"),
+        AgentEvent::ToolResult { tool, status, summary } => {
+            let icon = match status {
+                StepStatus::Ok => "✓",
+                StepStatus::NotConfirmed => "✋",
+                StepStatus::Blocked => "⛔",
+                _ => "✗",
+            };
+            eprintln!("    {icon} {tool}: {summary}")
+        }
+        AgentEvent::Verified { ok, detail, .. } if verbose => eprintln!("    {} geprüft: {detail}", if ok { "✓" } else { "✗" }),
+        AgentEvent::Error { message } => eprintln!("  ✗ {message}"),
+        AgentEvent::Phase { phase } if verbose => eprintln!("  [{phase:?}]"),
+        _ => {}
+    })
 }
 
 fn ok(label: &str, msg: impl std::fmt::Display) {
@@ -126,6 +164,43 @@ async fn run(cmd: Cmd, dir: &Path) -> Result<(), String> {
             let args: serde_json::Value = serde_json::from_str(&args).map_err(|e| format!("Argumente sind kein JSON: {e}"))?;
             let out = app.gateway.invoke(&tool, args, Origin::User).await.map_err(|e| e.to_string())?;
             println!("{}", out.text);
+            app.gateway.services().unload_all_unused().await;
+            Ok(())
+        }
+        Cmd::Agent { task, verbose } => {
+            let app = build(dir, Arc::new(TerminalConfirmer))?;
+            let agent = app.agent();
+            let out = agent.run(&task.join(" "), event_printer(verbose)).await;
+            println!("\n{}", out.answer);
+            eprintln!("[{} · {} Schritte · {} + {} Tokens · {:.1}s]", out.model, out.steps.len(), out.prompt_tokens, out.output_tokens, out.duration_ms as f64 / 1000.0);
+            app.gateway.services().unload_all_unused().await;
+            Ok(())
+        }
+        Cmd::Chat { verbose } => {
+            let app = build(dir, Arc::new(TerminalConfirmer))?;
+            let agent = app.agent();
+            println!("JARVIS bereit. Beenden mit 'exit', neuer Verlauf mit 'neu'.");
+            loop {
+                print!("\nDu › ");
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                    break;
+                }
+                match line.trim() {
+                    "" => continue,
+                    "exit" | "quit" | "tschüss" => break,
+                    "neu" => {
+                        agent.reset().await;
+                        println!("(Verlauf geleert)");
+                        continue;
+                    }
+                    t => {
+                        let out = agent.run(t, event_printer(verbose)).await;
+                        println!("\nJARVIS › {}", out.answer);
+                    }
+                }
+            }
             app.gateway.services().unload_all_unused().await;
             Ok(())
         }
