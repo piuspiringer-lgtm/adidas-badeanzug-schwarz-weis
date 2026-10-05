@@ -56,8 +56,26 @@ fi
 
 bold "3. Rust + Node.js (Entwicklung)"
 info "Rust ~1,5 GB (+ Build-Ordner 3–8 GB) · Node ~0,2 GB · kostenlos"
-if have cargo; then info "✓ Rust $(rustc --version | cut -d' ' -f2)"; elif have brew && ask "rustup über Homebrew installieren?"; then
-  brew install rustup && rustup-init -y --profile minimal && source "$HOME/.cargo/env"
+# Homebrews rustup ist "keg-only" (nicht im PATH) und bringt kein `rustup-init`
+# mit. Deshalb rustup direkt aus dem Formel-Ordner bzw. ~/.cargo/bin verwenden.
+rust_bin() {
+  local d
+  for d in "$HOME/.cargo/bin" "$(brew --prefix rustup 2>/dev/null)/bin"; do
+    [[ -x "$d/rustup" ]] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+if ! have cargo && RB=$(rust_bin); then export PATH="$RB:$PATH"; fi
+if have cargo && cargo --version >/dev/null 2>&1; then info "✓ Rust $(rustc --version | cut -d' ' -f2)"
+elif have brew && ask "Rust über rustup (Homebrew) einrichten?"; then
+  brew list --formula rustup >/dev/null 2>&1 || brew install rustup
+  RB=$(rust_bin) && export PATH="$RB:$PATH"
+  if rustup set profile minimal && rustup default stable; then
+    info "✓ $(rustc --version)"
+    info "Für neue Terminal-Fenster: bash scripts/fix-rust-mac.sh (setzt den PATH dauerhaft)"
+  else
+    info "⚠️  Rust-Einrichtung fehlgeschlagen → bash scripts/fix-rust-mac.sh"
+  fi
 fi
 if have node; then info "✓ Node $(node --version)"; elif have brew && ask "Node.js (LTS) installieren? (erst für die UI-Phase nötig)"; then brew install node; fi
 
@@ -103,7 +121,8 @@ info "Für bessere Qualität (kostenlos, ~0,2–0,5 GB, manuell):"
 info "Systemeinstellungen → Bedienungshilfen → Gesprochene Inhalte → Systemstimme → Stimmen verwalten → Deutsch → 'Anna (Premium)'"
 
 bold "8. JARVIS-CLI bauen und prüfen"
-if have cargo && ask "jarvis (Release) bauen? (~3–5 min, ~2 GB Build-Ordner)"; then
+if ! have cargo; then info "⚠️  cargo nicht gefunden – Build übersprungen. Bitte: bash scripts/fix-rust-mac.sh"
+elif ask "jarvis (Release) bauen? (~3–5 min, ~2 GB Build-Ordner)"; then
   cargo build --release -p jarvis-cli
   ./target/release/jarvis init
   ./target/release/jarvis doctor

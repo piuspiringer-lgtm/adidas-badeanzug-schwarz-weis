@@ -25,6 +25,7 @@ Lokal-first, kostenlos und mit einem strikten Permission-System.
 ```bash
 bash scripts/check-mac-env.sh      # nur lesen: Hardware & Tools
 bash scripts/setup-mac.sh          # fragt jeden Schritt einzeln
+bash scripts/fix-rust-mac.sh       # falls `cargo` fehlt: Rust prüfen/reparieren, CLI bauen, Doctor
 ./target/release/jarvis doctor     # alles prüfen
 ./target/release/jarvis ask "Was kannst du?"
 ./target/release/jarvis run fs_search '{"pattern":"*.pdf"}'
