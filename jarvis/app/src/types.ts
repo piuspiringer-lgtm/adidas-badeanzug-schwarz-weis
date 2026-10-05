@@ -10,7 +10,8 @@ export type AgentEvent =
   | { type: "plan"; text: string }
   | { type: "tools_selected"; tools: string[] }
   | { type: "tool_call"; tool: string; args: unknown }
-  | { type: "tool_result"; tool: string; status: StepStatus; summary: string }
+  | { type: "tool_result"; tool: string; status: StepStatus; summary: string; duration_ms?: number }
+  | { type: "llm_call"; purpose: string; model: string; duration_ms: number; prompt_tokens: number; output_tokens: number; hidden_reasoning_chars: number; truncated: boolean }
   | { type: "verified"; tool: string; ok: boolean; detail: string }
   | { type: "answer"; text: string }
   | { type: "error"; message: string };

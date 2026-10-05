@@ -71,7 +71,9 @@ pub enum AgentEvent {
     Plan { text: String },
     ToolsSelected { tools: Vec<String> },
     ToolCall { tool: String, args: Value },
-    ToolResult { tool: String, status: StepStatus, summary: String },
+    ToolResult { tool: String, status: StepStatus, summary: String, duration_ms: u128 },
+    /// Messung je Modellaufruf (Diagnose der Laufzeit).
+    LlmCall { purpose: String, model: String, duration_ms: u128, prompt_tokens: u64, output_tokens: u64, hidden_reasoning_chars: usize, truncated: bool },
     Verified { tool: String, ok: bool, detail: String },
     Answer { text: String },
     Error { message: String },
@@ -87,6 +89,11 @@ pub struct Outcome {
     pub prompt_tokens: u64,
     pub output_tokens: u64,
     pub duration_ms: u128,
+    /// Anzahl Modellaufrufe und deren Gesamtdauer.
+    pub llm_calls: u32,
+    pub llm_ms: u128,
+    /// Gesamtdauer aller Tool-Ausführungen.
+    pub tool_ms: u128,
 }
 
 /// Liefert den aktuellen Ressourcenmodus (produktiv: Monitor + decide_mode).
@@ -134,6 +141,12 @@ impl Default for AgentConfig {
 
 pub type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
+#[derive(Default)]
+struct Timing {
+    calls: u32,
+    ms: u128,
+}
+
 pub struct Agent {
     gateway: Arc<ToolGateway>,
     llm: Arc<dyn LlmClient>,
@@ -178,7 +191,8 @@ impl Agent {
 
     fn system_prompt(&self, request: &str, plan: Option<&str>, with_tools: bool) -> String {
         let mut s = String::from(
-            "Du bist JARVIS, ein lokaler Assistent auf einem Mac. Antworte knapp, sachlich und auf Deutsch.\n\
+            "Du bist JARVIS, ein lokaler Assistent auf einem Mac. Antworte knapp und sachlich in der Sprache des Benutzers (Standard: Deutsch).\n\
+             Gib nur die Antwort für den Benutzer aus – keine Überlegungen, keine Gedankengänge, keine englischen Notizen.\n\
              Regeln:\n\
              - Nutze Tools, um Fakten zu prüfen; erfinde keine Dateiinhalte, Pfade oder Ergebnisse.\n\
              - Verändernde Aktionen bestätigt der Benutzer selbst in einem Dialog. Frage nicht zusätzlich im Text nach.\n\
@@ -219,6 +233,36 @@ impl Agent {
             s.push_str(&format!("Plan:\n{p}\n"));
         }
         s
+    }
+
+    /// Modellaufruf mit Zeitmessung. Entfernter Denktext wird nur gezählt,
+    /// nie weitergegeben.
+    async fn timed_chat(
+        &self,
+        tier: jarvis_context::ModelTier,
+        messages: &[Message],
+        tools: &[Value],
+        purpose: &str,
+        emit: &EventSink,
+        timing: &mut Timing,
+    ) -> Result<llm::LlmReply, String> {
+        let t0 = Instant::now();
+        let r = self.llm.chat(tier, messages, tools).await;
+        let ms = t0.elapsed().as_millis();
+        timing.calls += 1;
+        timing.ms += ms;
+        if let Ok(r) = &r {
+            emit(AgentEvent::LlmCall {
+                purpose: purpose.into(),
+                model: r.model.clone(),
+                duration_ms: ms,
+                prompt_tokens: r.prompt_tokens,
+                output_tokens: r.output_tokens,
+                hidden_reasoning_chars: r.hidden_reasoning_chars,
+                truncated: r.truncated,
+            });
+        }
+        r
     }
 
     /// Führt eine Anfrage vollständig aus.
@@ -272,6 +316,7 @@ impl Agent {
 
         let mut prompt_tokens = 0;
         let mut output_tokens = 0;
+        let mut timing = Timing::default();
         // Tatsächlich antwortendes Modell (kann vom geplanten abweichen,
         // z. B. wenn das geladene Hauptmodell wiederverwendet wird).
         let mut model = model;
@@ -289,7 +334,7 @@ impl Agent {
                 ),
                 Message::new("user", request),
             ];
-            match self.llm.chat(tier, &msgs, &[]).await {
+            match self.timed_chat(tier, &msgs, &[], "Plan", &emit, &mut timing).await {
                 Ok(r) => {
                     prompt_tokens += r.prompt_tokens;
                     output_tokens += r.output_tokens;
@@ -319,7 +364,7 @@ impl Agent {
 
         for _ in 0..self.config.max_steps {
             emit(AgentEvent::Phase { phase: Phase::Execute });
-            let reply = match self.llm.chat(tier, &messages, &schemas).await {
+            let reply = match self.timed_chat(tier, &messages, &schemas, "Ausführen", &emit, &mut timing).await {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!("Sprachmodell-Fehler: {e}");
@@ -398,7 +443,20 @@ impl Agent {
         if mode == Mode::Critical {
             services.unload_all_unused().await;
         }
-        Outcome { answer: text, steps, success, intent, model, prompt_tokens, output_tokens, duration_ms: started.elapsed().as_millis() }
+        let tool_ms = steps.iter().map(|s| s.duration_ms).sum();
+        Outcome {
+            answer: text,
+            steps,
+            success,
+            intent,
+            model,
+            prompt_tokens,
+            output_tokens,
+            duration_ms: started.elapsed().as_millis(),
+            llm_calls: timing.calls,
+            llm_ms: timing.ms,
+            tool_ms,
+        }
     }
 
     async fn execute(
@@ -416,7 +474,7 @@ impl Agent {
 
         if executed.contains(&key) {
             let msg = "Dieser Aufruf wurde bereits ausgeführt – das Ergebnis steht oben. Nicht wiederholen.".to_string();
-            emit(AgentEvent::ToolResult { tool: call.name.clone(), status: StepStatus::Blocked, summary: "doppelter Aufruf übersprungen".into() });
+            emit(AgentEvent::ToolResult { tool: call.name.clone(), status: StepStatus::Blocked, summary: "doppelter Aufruf übersprungen".into(), duration_ms: 0 });
             return msg;
         }
         executed.push(key);
@@ -471,7 +529,7 @@ impl Agent {
             }
         };
         let _ = self.memory.record_tool_result(&call.name, intent, status == StepStatus::Ok, ms as f64);
-        emit(AgentEvent::ToolResult { tool: call.name.clone(), status, summary: summary.clone() });
+        emit(AgentEvent::ToolResult { tool: call.name.clone(), status, summary: summary.clone(), duration_ms: ms });
         steps.push(Step { tool: call.name.clone(), args: call.arguments.clone(), status, summary, verification, error, duration_ms: ms });
         observation
     }
@@ -533,6 +591,9 @@ impl Agent {
             prompt_tokens: 0,
             output_tokens: 0,
             duration_ms: started.elapsed().as_millis(),
+            llm_calls: 0,
+            llm_ms: 0,
+            tool_ms: 0,
         }
     }
 }

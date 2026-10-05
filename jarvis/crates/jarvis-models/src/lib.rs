@@ -46,8 +46,15 @@ pub struct ChatResult {
     pub tool_calls: Vec<Value>,
     pub prompt_tokens: u64,
     pub output_tokens: u64,
+    /// Antwort hat die Längenbegrenzung erreicht (abgeschnitten).
+    pub truncated: bool,
     pub used_fallback: bool,
 }
+
+/// Obergrenze für erzeugte Tokens pro Modellaufruf. Normale Antworten und
+/// Tool-Aufrufe sind weit kürzer; die Grenze verhindert minutenlange
+/// Generierung (z. B. durch Denktext), die Laufzeit bleibt so begrenzt.
+pub const MAX_OUTPUT_TOKENS: i64 = 1024;
 
 /// Dünner HTTP-Client für die Ollama-API (nur localhost).
 #[derive(Clone)]
@@ -114,13 +121,22 @@ impl OllamaClient {
     }
 
     pub async fn chat(&self, model: &str, messages: &[Message], tools: &[Value], num_ctx: usize, keep_alive: u64, think: bool) -> Result<ChatResult, ModelError> {
+        let mut messages = messages.to_vec();
+        // Qwen3: zusätzlich zum `think`-Parameter den offiziellen Soft-Switch
+        // setzen – wirkt auch, wenn Ollama/Template den Parameter ignoriert.
+        if !think && model.starts_with("qwen3") {
+            match messages.iter_mut().find(|m| m.role == "system") {
+                Some(m) => m.content.push_str("\n/no_think"),
+                None => messages.insert(0, Message::new("system", "/no_think")),
+            }
+        }
         let mut body = json!({
             "model": model,
             "messages": messages,
             "stream": false,
             "keep_alive": format!("{keep_alive}s"),
             "think": think,
-            "options": {"num_ctx": num_ctx, "temperature": 0.3}
+            "options": {"num_ctx": num_ctx, "temperature": 0.3, "num_predict": MAX_OUTPUT_TOKENS}
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
@@ -135,6 +151,7 @@ impl OllamaClient {
             tool_calls: v["message"]["tool_calls"].as_array().cloned().unwrap_or_default(),
             prompt_tokens: v["prompt_eval_count"].as_u64().unwrap_or(0),
             output_tokens: v["eval_count"].as_u64().unwrap_or(0),
+            truncated: v["done_reason"].as_str() == Some("length"),
             used_fallback: false,
         })
     }
@@ -415,6 +432,28 @@ mod tests {
         let r = m.chat(ModelTier::LocalMain, &[Message::new("user", "Hi")], &[]).await.unwrap();
         assert!(r.used_fallback);
         assert_eq!(r.model, "qwen3:4b");
+    }
+
+    /// Regression (Mac-Test): kein Denkmodus, begrenzte Länge.
+    #[tokio::test]
+    async fn qwen3_requests_disable_thinking_and_cap_output() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_partial_json(json!({"think": false, "options": {"num_predict": MAX_OUTPUT_TOKENS}})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "qwen3:8b", "message": {"role": "assistant", "content": "x"}, "done": true, "done_reason": "length"
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let m = manager(&s.uri());
+        let r = m.chat(ModelTier::LocalMain, &[Message::new("system", "Du bist JARVIS."), Message::new("user", "Hi")], &[]).await.unwrap();
+        assert!(r.truncated);
+        let req = &s.received_requests().await.unwrap()[0];
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        assert!(body["messages"][0]["content"].as_str().unwrap().ends_with("/no_think"), "{body}");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2, "keine zusätzliche Nachricht");
     }
 
     #[tokio::test]

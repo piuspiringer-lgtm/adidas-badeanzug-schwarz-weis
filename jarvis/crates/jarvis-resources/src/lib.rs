@@ -29,10 +29,30 @@ pub enum Thermal {
     Critical,
 }
 
+/// Speicherdruck laut macOS-Kernel (`kern.memorystatus_vm_pressure_level`).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MemoryPressure {
+    Normal,
+    Warning,
+    Critical,
+}
+
+/// 1 = normal, 2 = Warnung, 4 = kritisch.
+pub fn parse_pressure_level(v: &str) -> Option<MemoryPressure> {
+    match v.trim() {
+        "1" => Some(MemoryPressure::Normal),
+        "2" => Some(MemoryPressure::Warning),
+        "4" => Some(MemoryPressure::Critical),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Snapshot {
     pub total_ram_gb: f64,
     pub available_ram_gb: f64,
+    /// Nur macOS. Wenn vorhanden, entscheidet er statt `available_ram_gb`.
+    pub memory_pressure: Option<MemoryPressure>,
     pub cpu_usage_percent: f32,
     pub battery: Option<Battery>,
     pub thermal: Thermal,
@@ -92,9 +112,15 @@ pub fn recommend_profile(hw: &Hardware) -> ModelProfile {
 pub fn decide_mode(s: &Snapshot) -> Mode {
     let on_battery = s.battery.map(|b| !b.charging).unwrap_or(false);
     let pct = s.battery.map(|b| b.percent).unwrap_or(100);
-    if s.thermal >= Thermal::Serious || (on_battery && pct < 15) || s.available_ram_gb < 1.0 {
+    // macOS hält RAM bewusst voll (Cache, Kompression); "frei" ist dort kein
+    // Engpass-Signal. Den echten Engpass meldet der Kernel als Speicherdruck.
+    let (ram_critical, ram_low) = match s.memory_pressure {
+        Some(p) => (p == MemoryPressure::Critical, p >= MemoryPressure::Warning),
+        None => (s.available_ram_gb < 1.0, s.available_ram_gb < 3.0),
+    };
+    if s.thermal >= Thermal::Serious || (on_battery && pct < 15) || ram_critical {
         Mode::Critical
-    } else if s.low_power_mode || (on_battery && pct < 40) || s.thermal == Thermal::Fair || s.available_ram_gb < 3.0 {
+    } else if s.low_power_mode || (on_battery && pct < 40) || s.thermal == Thermal::Fair || ram_low {
         Mode::Saver
     } else if on_battery {
         Mode::Balanced
@@ -230,10 +256,12 @@ impl Monitor {
             && run("pmset", &["-g"])
                 .map(|o| o.lines().any(|l| l.trim_start().starts_with("lowpowermode") && l.trim_end().ends_with('1')))
                 .unwrap_or(false);
+        let memory_pressure = if mac { run("sysctl", &["-n", "kern.memorystatus_vm_pressure_level"]).as_deref().and_then(parse_pressure_level) } else { None };
         let gb = 1024f64.powi(3);
         Snapshot {
             total_ram_gb: self.sys.total_memory() as f64 / gb,
             available_ram_gb: self.sys.available_memory() as f64 / gb,
+            memory_pressure,
             cpu_usage_percent: self.sys.global_cpu_usage(),
             battery,
             thermal,
@@ -254,6 +282,7 @@ mod tests {
         Snapshot {
             total_ram_gb: 16.0,
             available_ram_gb: avail,
+            memory_pressure: None,
             cpu_usage_percent: 10.0,
             battery: batt.map(|(p, c)| Battery { percent: p, charging: c }),
             thermal: Thermal::Nominal,
@@ -287,6 +316,24 @@ mod tests {
         assert_eq!(decide_mode(&s), Mode::Critical);
         assert!(!settings_for(Mode::Critical).voice_enabled);
         assert!(settings_for(Mode::Saver).use_fallback_model);
+    }
+
+    /// Regression (Mac-Test): wenig "freier" RAM bei normalem Speicherdruck
+    /// darf auf macOS nicht das kleine Modell erzwingen.
+    #[test]
+    fn macos_memory_pressure_decides_instead_of_free_ram() {
+        let mut s = snap(Some((90, true)), 2.0);
+        assert_eq!(decide_mode(&s), Mode::Saver, "ohne Druckwert: alte Schwelle");
+        s.memory_pressure = Some(MemoryPressure::Normal);
+        assert_eq!(decide_mode(&s), Mode::Performance);
+        assert!(!settings_for(decide_mode(&s)).use_fallback_model);
+        s.memory_pressure = Some(MemoryPressure::Warning);
+        assert_eq!(decide_mode(&s), Mode::Saver);
+        s.memory_pressure = Some(MemoryPressure::Critical);
+        assert_eq!(decide_mode(&s), Mode::Critical);
+        assert_eq!(parse_pressure_level("1\n"), Some(MemoryPressure::Normal));
+        assert_eq!(parse_pressure_level("4"), Some(MemoryPressure::Critical));
+        assert_eq!(parse_pressure_level("x"), None);
     }
 
     #[test]

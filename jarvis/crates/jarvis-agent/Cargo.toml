@@ -20,4 +20,5 @@ chrono.workspace = true
 
 [dev-dependencies]
 jarvis-integrations.workspace = true
+wiremock.workspace = true
 tempfile.workspace = true

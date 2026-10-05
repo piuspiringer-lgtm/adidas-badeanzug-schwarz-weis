@@ -84,14 +84,24 @@ fn event_printer(verbose: bool) -> jarvis_agent::EventSink {
         AgentEvent::Plan { text } => eprintln!("  · Plan:\n{}", text.lines().map(|l| format!("      {l}")).collect::<Vec<_>>().join("\n")),
         AgentEvent::ToolsSelected { tools } if verbose => eprintln!("  · Tools: {}", tools.join(", ")),
         AgentEvent::ToolCall { tool, args } => eprintln!("  → {tool} {args}"),
-        AgentEvent::ToolResult { tool, status, summary } => {
+        AgentEvent::LlmCall { purpose, model, duration_ms, prompt_tokens, output_tokens, hidden_reasoning_chars, truncated } if verbose => {
+            let mut extra = String::new();
+            if hidden_reasoning_chars > 0 {
+                extra.push_str(&format!(" · Denktext verworfen: {hidden_reasoning_chars} Zeichen"));
+            }
+            if truncated {
+                extra.push_str(" · ABGESCHNITTEN (Längenlimit)");
+            }
+            eprintln!("  ⏱ Modell ({purpose}) {model}: {:.1} s · {prompt_tokens} Prompt- + {output_tokens} Antwort-Tokens{extra}", duration_ms as f64 / 1000.0)
+        }
+        AgentEvent::ToolResult { tool, status, summary, duration_ms } => {
             let icon = match status {
                 StepStatus::Ok => "✓",
                 StepStatus::NotConfirmed => "✋",
                 StepStatus::Blocked => "⛔",
                 _ => "✗",
             };
-            eprintln!("    {icon} {tool}: {summary}")
+            eprintln!("    {icon} {tool} ({duration_ms} ms): {summary}")
         }
         AgentEvent::Verified { ok, detail, .. } if verbose => eprintln!("    {} geprüft: {detail}", if ok { "✓" } else { "✗" }),
         AgentEvent::Error { message } => eprintln!("  ✗ {message}"),
@@ -173,6 +183,16 @@ async fn run(cmd: Cmd, dir: &Path) -> Result<(), String> {
             let out = agent.run(&task.join(" "), event_printer(verbose)).await;
             println!("\n{}", out.answer);
             eprintln!("[{} · {} Schritte · {} + {} Tokens · {:.1}s]", out.model, out.steps.len(), out.prompt_tokens, out.output_tokens, out.duration_ms as f64 / 1000.0);
+            if verbose {
+                let other = out.duration_ms.saturating_sub(out.llm_ms + out.tool_ms);
+                eprintln!(
+                    "[Zeit: Modell {:.1} s ({} Aufrufe) · Tools {:.2} s · Rest (Laden, Memory, Logik) {:.2} s]",
+                    out.llm_ms as f64 / 1000.0,
+                    out.llm_calls,
+                    out.tool_ms as f64 / 1000.0,
+                    other as f64 / 1000.0
+                );
+            }
             app.gateway.services().unload_all_unused().await;
             Ok(())
         }

@@ -98,6 +98,7 @@ export function reducer(s: UiState, a: Action): UiState {
         case "error":
           return { ...s, nextId: id + 1, reactor: "error", activity: push({ id, kind: "error", text: e.message }) };
         case "answer":
+        case "llm_call":
           return s;
       }
     }

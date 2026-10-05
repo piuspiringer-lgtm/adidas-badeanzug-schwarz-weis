@@ -20,6 +20,10 @@ pub struct LlmReply {
     pub model: String,
     pub prompt_tokens: u64,
     pub output_tokens: u64,
+    /// Länge des entfernten Denktexts (Zeichen) – nur zur Diagnose, nie sichtbar.
+    pub hidden_reasoning_chars: usize,
+    /// Antwort wurde durch die Längenbegrenzung abgeschnitten.
+    pub truncated: bool,
 }
 
 #[async_trait]
@@ -40,22 +44,23 @@ pub trait LlmClient: Send + Sync {
     }
 }
 
-/// Entfernt `<think>…</think>`-Blöcke (Qwen3) aus sichtbaren Antworten.
+/// Entfernt Denk-/Planungstext des Modells, damit er nie beim Benutzer landet:
+/// * `<think>…</think>`-Blöcke,
+/// * ein offenes `<think>` ohne Ende (alles danach),
+/// * ein **einzelnes schließendes** `</think>` (alles davor). So liefern Qwen3-
+///   "Thinking"-Varianten ihren Denktext, weil das öffnende Tag im Template steckt.
 pub fn strip_thinking(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find("<think>") {
-        out.push_str(&rest[..i]);
-        match rest[i..].find("</think>") {
-            Some(j) => rest = &rest[i + j + "</think>".len()..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out.trim().to_string()
+    // Alles bis einschließlich des letzten schließenden Tags ist Denktext.
+    let s = match s.rfind("</think>") {
+        Some(i) => &s[i + "</think>".len()..],
+        None => s,
+    };
+    // Ein danach noch offenes <think> (abgebrochene Generierung): Rest verwerfen.
+    let s = match s.find("<think>") {
+        Some(i) => &s[..i],
+        None => s,
+    };
+    s.trim().to_string()
 }
 
 fn parse_args(v: &Value) -> Value {
@@ -99,7 +104,16 @@ impl LlmClient for ModelManager {
     async fn chat(&self, tier: ModelTier, messages: &[Message], tools: &[Value]) -> Result<LlmReply, String> {
         let r = ModelManager::chat(self, tier, messages, tools).await.map_err(|e| e.to_string())?;
         let (tool_calls, content) = parse_tool_calls(&r.tool_calls, &r.content);
-        Ok(LlmReply { content, tool_calls, model: r.model, prompt_tokens: r.prompt_tokens, output_tokens: r.output_tokens })
+        let hidden_reasoning_chars = r.content.chars().count().saturating_sub(content.chars().count());
+        Ok(LlmReply {
+            content,
+            tool_calls,
+            model: r.model,
+            prompt_tokens: r.prompt_tokens,
+            output_tokens: r.output_tokens,
+            hidden_reasoning_chars,
+            truncated: r.truncated,
+        })
     }
 
     fn context_window(&self) -> usize {
@@ -139,5 +153,21 @@ mod tests {
     fn thinking_is_removed() {
         assert_eq!(strip_thinking("<think>a</think>\nAntwort"), "Antwort");
         assert_eq!(strip_thinking("Antwort<think>unvollständig"), "Antwort");
+        assert_eq!(strip_thinking("<think>a</think>X<think>b</think>Y"), "Y");
+        assert_eq!(strip_thinking("Ohne Denktext."), "Ohne Denktext.");
+    }
+
+    /// Regression (Mac-Test): Qwen3-Thinking liefert nur das schließende Tag.
+    #[test]
+    fn leaked_reasoning_before_closing_tag_is_removed() {
+        let raw = "Okay, let's see. The user asked to find PDFs in the Documents folder. \
+                   I called fs_search and it returned two files, so I should list them in German.\n</think>\n\n\
+                   Ich habe 2 PDFs in Dokumente gefunden: Rechnung.pdf und Zeugnis.pdf.";
+        let out = strip_thinking(raw);
+        assert_eq!(out, "Ich habe 2 PDFs in Dokumente gefunden: Rechnung.pdf und Zeugnis.pdf.");
+        assert!(!out.contains("let's see"));
+        let (calls, text) = parse_tool_calls(&[], raw);
+        assert!(calls.is_empty());
+        assert!(text.starts_with("Ich habe 2 PDFs"));
     }
 }
